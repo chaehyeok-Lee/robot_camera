@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.claude/
+hand_eye_calibration.json
+holes_*.json
