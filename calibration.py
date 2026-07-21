@@ -43,6 +43,7 @@ def load_camera_to_robot(path: Path = DEFAULT_CALIBRATION_PATH) -> np.ndarray:
 
 def transform_point(point_camera_m: np.ndarray, camera_to_robot: np.ndarray) -> np.ndarray:
     """카메라 좌표계의 점 하나(x, y, z[m])를 로봇 베이스 좌표계로 변환한다."""
-    homogeneous = np.append(point_camera_m, 1.0)  # 동차좌표로 확장 (x,y,z,1)
+    homogeneous = np.append(point_camera_m, 1.0)  # 동차좌표로 확장 (x,y,z,1) 4차원 백터로 만들어 회전,이동을 곱 하나로 해결 가능 -> 다중 복합 관절 사용할때 곱으로 해결
     robot_point = camera_to_robot @ homogeneous
     return robot_point[:3]
+

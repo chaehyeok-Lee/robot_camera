@@ -1,18 +1,19 @@
-"""[역할] Depth 기반 홀(스터드/스파이크 구멍) 탐지 알고리즘의 핵심 모듈.
+"""[역할] RGB Hough Circle + Depth 국소 링(ring) 검증 기반 홀 탐지.
 
-3D 프린트된 타이어 트레드는 검은색 무광 플라스틱이라 RGB만으로는 홀을 찾기
-어렵다(대비가 거의 없음). 그래서 이 모듈은 RGB를 쓰지 않고 depth map만으로
-홀을 찾는다: 홀은 "주변 트레드 표면보다 카메라에서 더 멀리 떨어진(더 깊은)
-국소 영역"이라는 성질을 이용한다.
+기존(v1) 방식은 이미지 전체에 morphological opening으로 baseline 표면을 추정한
+뒤 잔차(residual)로 홀을 찾았는데, 이 물체(V자 트레드 문양)에서는 baseline
+추정 커널이 홀 옆의 V자 띠까지 걸쳐서 baseline 자체가 오염되는 근본 문제가
+있었다 (README "알려진 근본 문제" 참고).
 
-방법: 예상 홀 지름보다큰 커널로 depth map에 g rayscale morphological
-"opening"을 적용하면, 홀처럼 국소적으로 튀어나온(depth 값이 커진) 부분이
-지워지고 "홀이 없었다면 이랬을 것"이라는 기준 표면(baseline)이 복원된다.
-(타이어 표면이 평면이 아니라 곡면이어도 국소적으로는 잘 동작한다.)
-실측 depth와 baseline의 차이(residual)가 큰 곳이 곧 홀이다.
-
-model.py가 이 모듈의 HoleDetector를 호출해서 실시간 프레임마다 홀 목록을
-받아온다.
+이 버전은 순서를 바꾼다:
+1. RGB(CLAHE 보정) + depth 국소 굴곡(depression) 이미지 양쪽에서 Hough Circle로
+   "원형 후보"를 먼저 찾는다 (baseline 오염과 무관하게 동작).
+2. 각 후보마다 이미지 전체가 아니라 그 후보를 감싸는 **고리(ring) 영역**의 depth만
+   참조값으로 써서 실제로 파여있는지 검증한다 (커널이 옆으로 새는 문제가 없음).
+3. 후보 주변을 8방향으로 나눠 "모든 방향에서 깊은지"를 확인한다 - 진짜 둥근 홀은
+   사방에서 깊고, 트레드 홈(V자 띠)은 홈이 지나가는 한두 방향에서만 깊으므로 이
+   차이로 확실하게 구분한다.
+4. 후보의 깊은 영역이 반경 밖 그루브까지 이어지면(=홈의 일부) 제외한다.
 """
 from __future__ import annotations
 
@@ -21,79 +22,103 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-    #카메라 사양 확인 후 값 수정
+
 @dataclass
 class HoleDetectorConfig:
-    """[역할] 탐지 파라미터 모음. 실제 설치 환경/부품 스펙에 맞게 튜닝하는 곳.
+    """[역할] 탐지 파라미터 모음.
 
     스터드 핀(압정) 스펙: 머리 지름 11mm / 깊이 3mm (= 카메라가 찾아야 하는
-    입구 원), 끝부분 지름 2mm / 깊이 7mm (= 입구 안쪽 깊은 곳이라 D435 해상도
-    밖이고 카메라로 볼 대상이 아님 - 로봇이 11mm 입구 중심만 정확히 맞추면 됨).
+    입구 원). 실측(다중 프레임 평균)으로는 depth 양자화 + 부분 부피 효과 때문에
+    실제 residual이 1~2mm 정도로 관측된다.
     """
 
     # 물체(타이어 출력물) 분리용 거리 범위 - 카메라를 타이어 정면 20~40cm로
-    # 옮긴 구도 기준. 이 정도 거리면 D435 depth 노이즈가 1mm 이하로 떨어져서
-    # 3mm짜리 홀 깊이와 노이즈가 잘 구분된다.
+    # 옮긴 구도 기준.
     min_object_distance_m: float = 0.18
     max_object_distance_m: float = 0.45
 
-    # [진단용 임시값] min만 낮춰서 크기 필터를 느슨하게 함. max는 baseline
-    # 커널 크기 계산에도 쓰이므로 원래 스펙(11mm)에 가깝게 유지 - 20mm로
-    # 키우면 커널도 같이 커져서 baseline 추정 자체가 왜곡될 수 있음.
-    min_hole_diameter_mm: float = 3.0
-    max_hole_diameter_mm: float = 15.0
+    # 트레드에서 가장 넓은 채널의 폭(mm) - tire_chevron_v4.stl 기준 V자/중앙
+    # 채널이 5mm로 가장 넓음. segment_object의 Closing 커널이 이보다 확실히
+    # 커야 채널 때문에 블록들이 서로 다른 섬으로 갈라지지 않는다.
+    max_channel_width_mm: float = 6.0
 
-    # 홀 바닥이 주변 표면(baseline)보다 몇 mm 더 깊어야 "진짜 홀"로 인정할지
-    # (하한/상한 둘 다). 실측으로는 진짜 홀이 1~2mm 범위로 관측되고, 그보다
-    # 큰 값(3mm+)은 V자 띠 등 다른 구조물일 가능성이 높아 상한으로 제외한다.
+    # 핀 머리가 들어가는 입구 지름 11mm 기준, 프린팅 오차 대비 여유
+    min_hole_diameter_mm: float = 9.0
+    max_hole_diameter_mm: float = 13.0
+
+    # 후보 중심이 주변 링보다 몇 mm 더 깊어야(=멀어야) "진짜 홀"로 인정할지
     min_hole_depth_mm: float = 0.8
     max_hole_depth_mm: float = 2.5
 
-    # [진단용 임시값] 원래 0.55 -> 진짜 홀이 V자 띠와 맞닿아 있어서 컨투어가
-    # 합쳐지고 있는지 확인하려고 잠깐 낮춰놓음. 확인되면 다시 0.55 근처로 복구.
-    min_circularity: float = 0.3
+    # Hough Circle 파라미터 (Canny 상위 임계값 / 누산기 임계값 - 낮을수록 후보가 늘어남).
+    # 우리 depression 이미지는 실측 신호가 약해서(1~2mm ≈ 밝기 2~4단계) 대비가 매우
+    # 낮다 - 원본(depth_v1.py 기본값 50/16)은 이 신호 세기에서 후보를 아예 못 찾아서
+    # 낮췄다. 후보가 늘어나는 대신 링/8섹터/연결성 검증 단계가 걸러낸다.
+    hough_param1: float = 10.0
+    hough_param2: float = 5.0
 
-    # baseline 표면 추정에 쓰는 morphology 커널 크기(px). 0이면 매 프레임마다
-    # max_hole_diameter_mm과 현재 거리 기준 px/mm 스케일로 자동 계산.
-    baseline_kernel_px: int = 0
-    
+    # 후보 원 중심 사이 최소 간격(mm) - px는 매 프레임 거리로 자동 환산
+    min_candidate_distance_mm: float = 15.0
+
+    # 국소 표면(baseline) 추정용 가우시안 블러의 sigma(px). 0이면 최대 홀 반지름의
+    # 약 2.5배로 매 프레임 자동 계산 - 실측 검증 결과 sigma가 홀 반지름의 최소
+    # 2~2.5배는 돼야 블러가 홀을 확실히 "지우고" 진짜 배경 표면을 복원한다
+    # (sigma가 반지름과 비슷한 정도면 홀 자신의 값이 local_surface에 새어 들어가
+    # residual이 실제보다 훨씬 작게 나옴).
+    surface_blur_sigma_px: float = 0.0
+
+    # 후보의 깊은 영역이 이 mm 임계값 기준으로 반경 밖까지 이어지면 그루브(홈)의
+    # 일부로 보고 제외한다.
+    connection_depth_mm: float = 1.0
+
+    # 8방향 섹터 중 몇 개 이상에서 깊어야 "둥근 홀"로 인정할지 (화면 중앙 기준,
+    # 가장자리는 스테레오 매칭 품질이 떨어져서 자동으로 완화됨)
+    required_deep_sectors: int = 5
+
 
 @dataclass
 class DetectedHole:
     """[역할] 탐지된 홀 하나의 정보를 담는 결과 객체."""
 
     pixel: tuple  # 이미지 상의 (u, v) 중심 좌표 (px)
-    depth_m: float  # 홀 바닥의 depth (중앙값), 미터
-    hole_depth_mm: float  # 주변 표면 대비 홀이 얼마나 깊은지 (mm)
+    depth_m: float  # 홀 바닥 depth 추정치, 미터
+    hole_depth_mm: float  # 주변 링 대비 홀이 얼마나 깊은지 (mm)
     diameter_px: float
     point_camera_m: np.ndarray = field(repr=False)  # 카메라 좌표계 (x, y, z), 미터
 
 
-class HoleDetector:
-    """[역할] depth map 한 장을 받아 홀 목록을 반환하는 탐지기 본체."""
+def _valid_median(values: np.ndarray) -> float | None:
+    """0(무효) 픽셀을 제외한 median. 유효 픽셀이 없으면 None."""
+    valid = values[values > 0]
+    return float(np.median(valid)) if valid.size else None
 
+
+class HoleDetector:
     def __init__(self, intrinsics, config: HoleDetectorConfig | None = None):
         self.intrinsics = intrinsics  # 픽셀->3D 변환에 필요한 카메라 내부 파라미터 (rs.intrinsics)
         self.config = config or HoleDetectorConfig()
 
-    def segment_object(self, depth_m: np
-                       .ndarray) -> np.ndarray:
+    def segment_object(self, depth_m: np.ndarray) -> np.ndarray:
         """[역할] 배경을 떼어내고 타이어 출력물만 마스크로 남긴다.
 
-        거리 밴드(min~max_object_distance_m)로 1차 필터링한 뒤, 노  이즈 제거를
-        위해 열림/닫힘 연산을 적용하고, 가장 큰 연결 성분(=출력물 본체)만
-        남긴다.
+        거리 범위 필터 + 노이즈 제거(열림/닫힘) + 가장 큰 연결 성분 선택.
+
+        닫힘(Closing) 커널은 트레드 채널 폭(최대 5mm, V자/중앙 채널)보다 확실히
+        커야 한다 - 그렇지 않으면 채널이 블록들을 서로 다른 "섬"으로 갈라놓고,
+        "가장 큰 섬 하나"만 물체로 인정돼서 나머지 블록(과 그 안의 홀)이 전부
+        배경으로 취급돼 버린다 (실측으로 확인된 문제). 커널 크기는 가장 가까운
+        촬영 거리(worst case, px/mm이 가장 커지는 지점) 기준으로 계산해서
+        어떤 거리에서도 채널을 확실히 이어붙이게 한다.
         """
         cfg = self.config
         valid = (depth_m > cfg.min_object_distance_m) & (depth_m < cfg.max_object_distance_m)
         mask = valid.astype(np.uint8) * 255
-        # 열림 침식 후 팽창으로 작은 노이즈 제거, 5px보다 작은 구멍 제거
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-        # depth 측정 실패로 작은 구멍이 생기면 팽창이 그 구멍을 메우고 침식이 바깥 경계로 되돌림 2단계에서 바깥 노이즈를 2단계에서 제거, 팽창이 
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
 
-        # 가장 큰 연결 성분만 남김, 흰 덩어리마다 번호를 붙이고 면적을 구함 -> 가장 큰 번호만 남기고 나머지 노이즈 처리
-        # connectivity 어느 흰 픽셀들을 하나의 덩어리로 묶을지 4 = 상하좌우 , 8 = 대각선 포함 3^2-1
+        worst_case_px_per_mm = self.intrinsics.fx / (cfg.min_object_distance_m * 1000.0)
+        closing_px = max(9, int(round(cfg.max_channel_width_mm * worst_case_px_per_mm)) | 1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((closing_px, closing_px), np.uint8))
+
         num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
         if num <= 1:
             return mask
@@ -101,123 +126,200 @@ class HoleDetector:
         return np.where(labels == largest, 255, 0).astype(np.uint8)
 
     def _px_per_mm(self, depth_m: np.ndarray, object_mask: np.ndarray) -> float:
-        """[역할] 현재 촬영 거리에서 1mm가 몇 픽셀에 해당하는지 환산.
-
-        홀 지름(mm) 기준값들을 픽셀 단위 면적/커널 크기로 바꾸는 데 쓰인다.
-        """
         region_depth = depth_m[object_mask > 0]
         median_depth_m = float(np.median(region_depth)) if region_depth.size else 0.3
         return self.intrinsics.fx / (median_depth_m * 1000.0)
 
-    def detect(self, depth_m: np.ndarray):
-        """[역할] 메인 파이프라인: 물체 분리 -> baseline 표면 추정 -> 잔차로
-        홀 마스크 생성 -> 개별 홀 추출. (holes 리스트, 디버그용 중간 결과) 반환.
+    def _make_depression_image(self, depth_mm: np.ndarray, object_mask: np.ndarray, sigma_px: float) -> np.ndarray:
+        """[역할] "국소 표면보다 얼마나 더 먼가"를 8비트 밝기로 인코딩한 이미지.
+
+        가우시안 블러로 만든 매끈한 국소 표면(=holes 없다고 가정한 baseline)과
+        실측값의 차이를 밝기로 표현한다. 1단위 ≈ 0.5mm, 최대 127.5mm에서 포화.
+
+        sigma는 반드시 명시적으로 지정한다 - GaussianBlur에 sigma=0(자동)을 주면
+        커널 크기와 무관하게 실제 블러 반경이 훨씬 작게 계산돼서, 홀 크기에 맞춰
+        큰 커널을 줘도 블러가 홀을 제대로 못 지우는 문제가 있었다 (실측으로 확인).
+        """
+        valid = (depth_mm > 0) & (object_mask > 0)
+        if not np.any(valid):
+            return np.zeros(depth_mm.shape, dtype=np.uint8)
+
+        fill_value = float(np.median(depth_mm[valid]))
+        filled = np.where(valid, depth_mm, fill_value).astype(np.float32)
+        filled = cv2.medianBlur(filled, 5)
+
+        kernel_px = int(6 * sigma_px + 1) | 1  # OpenCV 권장: 커널 >= 6*sigma+1
+        local_surface = cv2.GaussianBlur(filled, (kernel_px, kernel_px), sigma_px)
+        depression_mm = np.maximum(filled - local_surface, 0)
+        depression_mm[object_mask == 0] = 0
+
+        return np.clip(depression_mm * 2.0, 0, 255).astype(np.uint8)
+
+    def _hough_candidates(
+        self, image: np.ndarray, min_distance_px: float, min_radius_px: int, max_radius_px: int
+    ) -> list[tuple[int, int, int]]:
+        cfg = self.config
+        circles = cv2.HoughCircles(
+            cv2.medianBlur(image, 5),
+            cv2.HOUGH_GRADIENT,
+            dp=1.0,
+            minDist=min_distance_px,
+            param1=cfg.hough_param1,
+            param2=cfg.hough_param2,
+            minRadius=min_radius_px,
+            maxRadius=max_radius_px,
+        )
+        if circles is None:
+            return []
+        return [tuple(map(int, c)) for c in np.rint(circles[0]).astype(np.int32)]
+
+    def _circle_depth_evidence(self, depth_mm: np.ndarray, x: int, y: int, radius: int):
+        """[역할] 후보 원 하나를 감싸는 링(ring) 영역의 depth로 실제 함몰 여부를 검증.
+
+        반환: (recess_mm 또는 None, 중심 무효 비율, 링 유효 비율, 8방향 섹터별
+        recess 배열, 링 depth mm). 링 자체가 무효면 None.
+        """
+        height, width = depth_mm.shape
+        outer_radius = max(int(radius * 1.65), radius + 3)
+        left, right = max(0, x - outer_radius), min(width, x + outer_radius + 1)
+        top, bottom = max(0, y - outer_radius), min(height, y + outer_radius + 1)
+        if right - left < 3 or bottom - top < 3:
+            return None
+
+        yy, xx = np.ogrid[top:bottom, left:right]
+        distance2 = (xx - x) ** 2 + (yy - y) ** 2
+        inner = distance2 <= max(2, int(radius * 0.55)) ** 2
+        ring = (distance2 >= int(radius * 1.10) ** 2) & (distance2 <= outer_radius ** 2)
+        crop = depth_mm[top:bottom, left:right]
+
+        inner_values, ring_values = crop[inner], crop[ring]
+        inner_depth = _valid_median(inner_values)
+        ring_depth = _valid_median(ring_values)
+        if ring_depth is None:
+            return None
+        ring_valid_fraction = float(np.mean(ring_values > 0))
+        invalid_fraction = float(np.mean(inner_values <= 0))
+        recess_mm = None if inner_depth is None else inner_depth - ring_depth
+
+        sector_recesses = []
+        angle = np.arctan2(yy - y, xx - x)
+        for sector in range(8):
+            lower = -np.pi + sector * (np.pi / 4)
+            upper = lower + (np.pi / 4)
+            sector_ring = ring & (angle >= lower) & (angle < upper)
+            sector_depth = _valid_median(crop[sector_ring])
+            sector_recesses.append(
+                np.nan if inner_depth is None or sector_depth is None else inner_depth - sector_depth
+            )
+        return recess_mm, invalid_fraction, ring_valid_fraction, np.array(sector_recesses), ring_depth
+
+    def _connects_to_outside_depression(
+        self, depression: np.ndarray, x: int, y: int, radius: int, threshold_mm: float
+    ) -> bool:
+        """[역할] 후보의 "깊은 영역"이 반경 1.75배 밖까지 이어지면 그루브(홈)의
+        일부로 보고 True. 진짜 홀은 고립된 국소 함몰이라 이어지지 않는다.
+        """
+        reach_radius = max(int(np.ceil(radius * 1.75)), radius + 4)
+        left, right = max(0, x - reach_radius), min(depression.shape[1], x + reach_radius + 1)
+        top, bottom = max(0, y - reach_radius), min(depression.shape[0], y + reach_radius + 1)
+        if right - left < 3 or bottom - top < 3:
+            return False
+
+        crop = depression[top:bottom, left:right]
+        mask = (crop >= int(np.ceil(threshold_mm * 2.0))).astype(np.uint8)
+        _, labels = cv2.connectedComponents(mask, connectivity=8)
+        yy, xx = np.ogrid[top:bottom, left:right]
+        distance2 = (xx - x) ** 2 + (yy - y) ** 2
+        centre = distance2 <= max(2, int(radius * 0.45)) ** 2
+        outside = distance2 >= max(int(radius * 1.50), radius + 3) ** 2
+        centre_labels = np.unique(labels[centre])
+        centre_labels = centre_labels[centre_labels != 0]
+        return any(np.any(labels[outside] == label) for label in centre_labels)
+
+    def detect(self, color_bgr: np.ndarray, depth_m: np.ndarray):
+        """[역할] 메인 파이프라인: 물체 분리 -> Hough로 원형 후보 검출(RGB+depth
+        양쪽) -> 후보별 링/8섹터/연결성 검증 -> 3D 좌표 계산. (holes, debug) 반환.
         """
         cfg = self.config
         object_mask = self.segment_object(depth_m)
         if cv2.countNonZero(object_mask) == 0:
             empty = np.zeros_like(object_mask)
-            return [], {"object_mask": object_mask, "hole_mask": empty, "residual_mm": None}
+            return [], {"object_mask": object_mask, "depression": empty, "candidate_count": 0}
 
         px_per_mm = self._px_per_mm(depth_m, object_mask)
-        # baseline 추정 커널은 홀보다 커야 홀을 "지워서" 복원할 수 있다
-        kernel_px = cfg.baseline_kernel_px or (max(3, int(round(cfg.max_hole_diameter_mm * px_per_mm))) | 1)
-
         depth_mm = depth_m * 1000.0
-        # 물체 바깥/무효(0) depth는 물체의 최댓값(가장 먼 지점)으로 채워서
-        # 배경이나 결측치가 홀로 오검출되지 않게 한다.
-        object_depths = depth_mm[(object_mask > 0) & (depth_mm > 0)]
-        fill_value = float(np.max(object_depths)) if object_depths.size else 0.0
-        working = np.where((object_mask > 0) & (depth_mm > 0), depth_mm, fill_value).astype(np.float32)
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_px, kernel_px))
-        # opening(침식 후 팽창)은 depth map에서 국소적으로 튀어나온(=먼 거리,
-        # 즉 홀) 부분을 지우고 주변 표면으로 채워서 "홀이 없다고 가정한"
-        # 기준 표면(baseline)을 만들어낸다.
-        baseline_mm = cv2.morphologyEx(working, cv2.MORPH_OPEN, kernel)
+        min_radius_px = max(2, int(round(cfg.min_hole_diameter_mm / 2 * px_per_mm)))
+        max_radius_px = max(min_radius_px + 1, int(round(cfg.max_hole_diameter_mm / 2 * px_per_mm)))
+        min_distance_px = max(4.0, cfg.min_candidate_distance_mm * px_per_mm)
+        sigma_px = cfg.surface_blur_sigma_px or (max_radius_px * 2.5)
 
-        # 실측값이 baseline보다 멀다(양수) = 그 자리에 구멍이 파여 있다는 뜻
-        residual_mm = working - baseline_mm
-        residual_mm[object_mask == 0] = 0
+        depression = self._make_depression_image(depth_mm, object_mask, sigma_px)
 
-        # depth 값이 0(측정 실패)인 픽셀도 강한 홀 신호로 취급한다: 좁고 깊은
-        # 홀은 IR 스테레오 매칭 자체가 실패해서 무효값이 찍히는 경우가 많다.
-        dropout = (object_mask > 0) & (depth_mm == 0)
-        if np.any(dropout):
-            fallback = max(cfg.min_hole_depth_mm * 3, float(np.max(residual_mm)) if residual_mm.size else 0.0)
-            residual_mm[dropout] = fallback
+        gray = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+        gray = np.where(object_mask > 0, gray, 0).astype(np.uint8)
 
-        # 잔차가 [min, max] 범위 안일 때만 홀 마스크로 확정 (하한=노이즈 제외,
-        # 상한=V자 띠처럼 훨씬 깊은 다른 구조물 제외). 자잘한 노이즈는 열림 연산으로 제거
-        hole_mask = (
-            (residual_mm >= cfg.min_hole_depth_mm)
-            & (residual_mm <= cfg.max_hole_depth_mm)
-            & (object_mask > 0)
-        ).astype(np.uint8) * 255
-        hole_mask = cv2.morphologyEx(hole_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        candidates = self._hough_candidates(depression, min_distance_px, min_radius_px, max_radius_px)
+        candidates += self._hough_candidates(gray, min_distance_px, min_radius_px, max_radius_px)
 
-        holes = self._extract_holes(hole_mask, depth_m, residual_mm, px_per_mm)
+        unique_candidates: list[tuple[int, int, int]] = []
+        for cx, cy, cr in candidates:
+            if all((cx - ux) ** 2 + (cy - uy) ** 2 > (min(cr, ur) * 0.7) ** 2 for ux, uy, ur in unique_candidates):
+                unique_candidates.append((cx, cy, cr))
+
+        holes = self._verify_candidates(unique_candidates, depth_mm, depression, object_mask)
         debug = {
             "object_mask": object_mask,
-            "hole_mask": hole_mask,
-            "residual_mm": residual_mm,
+            "depression": depression,
+            "candidate_count": len(unique_candidates),
             "px_per_mm": px_per_mm,
-            "kernel_px": kernel_px,  # 진단용: baseline opening에 실제로 쓰인 커널 크기(px)
-            "working_mm": working,  # 진단용: object_mask 적용 후 실측 depth(mm)
-            "baseline_mm": baseline_mm,  # 진단용: opening으로 복원한 기준 표면(mm)
         }
         return holes, debug
 
-    def _extract_holes(self, hole_mask, depth_m, residual_mm, px_per_mm):
-        """[역할] 이진 홀 마스크에서 개별 홀 블롭을 찾아 크기/원형도로
-        필터링하고, 각 홀의 중심 픽셀 -> 3D 좌표까지 계산해 DetectedHole로 반환.
-        """
+    def _verify_candidates(self, candidates, depth_mm, depression, object_mask):
         cfg = self.config
-        contours, _ = cv2.findContours(hole_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        min_area_px = np.pi * (cfg.min_hole_diameter_mm / 2 * px_per_mm) ** 2
-        max_area_px = np.pi * (cfg.max_hole_diameter_mm / 2 * px_per_mm) ** 2 * 2.5  # 여유있게 상한 설정
-
+        height, width = depth_mm.shape
         holes: list[DetectedHole] = []
-        for contour in contours:
-            # 1) 면적 필터: 설계된 홀 크기 범위 밖이면 제외
-            area = cv2.contourArea(contour)
-            if area < min_area_px or area > max_area_px:
+        for x, y, radius in candidates:
+            if not (0 <= x < width and 0 <= y < height) or object_mask[y, x] == 0:
                 continue
-            # 2) 원형도 필터: 홀은 원형에 가까워야 함, 길쭉한 잡음/모서리 제외
-            perimeter = cv2.arcLength(contour, True)
-            if perimeter <= 0:
+            evidence = self._circle_depth_evidence(depth_mm, x, y, radius)
+            if evidence is None:
                 continue
-            circularity = 4 * np.pi * area / (perimeter ** 2)
-            if circularity < cfg.min_circularity:
+            recess_mm, invalid_fraction, ring_valid_fraction, sector_recesses, ring_depth_mm = evidence
+
+            diameter_mm = (2.0 * radius * ring_depth_mm) / self.intrinsics.fx
+            if diameter_mm < cfg.min_hole_diameter_mm or diameter_mm > cfg.max_hole_diameter_mm * 1.5:
+                continue
+            if self._connects_to_outside_depression(depression, x, y, radius, cfg.connection_depth_mm):
                 continue
 
-            single_mask = np.zeros(hole_mask.shape, dtype=np.uint8)
-            cv2.drawContours(single_mask, [contour], -1, 255, thickness=cv2.FILLED)
+            edge_ratio = max(abs(x - width / 2) / (width / 2), abs(y - height / 2) / (height / 2))
+            is_edge = edge_ratio >= 0.60  # 화면 가장자리는 스테레오 매칭이 덜 완전해서 기준 완화
+            required_ring_valid = 0.55 if is_edge else 0.75
+            required_sectors = 4 if is_edge else cfg.required_deep_sectors
+            required_depth = cfg.min_hole_depth_mm * (0.75 if is_edge else 1.0)
 
-            # 홀 하나의 픽셀 중심(무게중심) 계산
-            moments = cv2.moments(contour)
-            if moments["m00"] == 0:
+            if ring_valid_fraction < required_ring_valid:
                 continue
-            u = moments["m10"] / moments["m00"]
-            v = moments["m01"] / moments["m00"]
 
-            # 해당 홀 영역의 실측 depth 중앙값 -> 3D 좌표 계산에 사용
-            region_depth = depth_m[single_mask > 0]
-            region_depth = region_depth[region_depth > 0]
-            if region_depth.size == 0:
+            deep_sectors = int(np.count_nonzero(sector_recesses >= required_depth))
+            accepted = recess_mm is not None and recess_mm <= cfg.max_hole_depth_mm and deep_sectors >= required_sectors
+            # 아주 좁고 깊은 홀은 중심부 depth 측정 자체가 실패(무효)할 수 있다 -
+            # 그 경우 링이 충분히 유효하고 중심 무효 비율이 높으면 홀로 인정.
+            if not accepted and recess_mm is None:
+                accepted = invalid_fraction >= 0.65 and ring_valid_fraction >= (0.80 if is_edge else 0.95)
+            if not accepted:
                 continue
-            hole_depth_m = float(np.median(region_depth))
-            hole_depth_mm = float(np.median(residual_mm[single_mask > 0]))
-            diameter_px = 2 * np.sqrt(area / np.pi)
 
-            # 픽셀 좌표 + depth -> 카메라 좌표계 3D 점으로 역투영(deproject)
-            point = rs_deproject(self.intrinsics, u, v, hole_depth_m)
+            floor_depth_mm = ring_depth_mm + (recess_mm if recess_mm is not None else cfg.min_hole_depth_mm)
+            point = rs_deproject(self.intrinsics, x, y, floor_depth_mm / 1000.0)
             holes.append(DetectedHole(
-                pixel=(int(round(u)), int(round(v))),
-                depth_m=hole_depth_m,
-                hole_depth_mm=hole_depth_mm,
-                diameter_px=diameter_px,
+                pixel=(x, y),
+                depth_m=floor_depth_mm / 1000.0,
+                hole_depth_mm=recess_mm if recess_mm is not None else cfg.min_hole_depth_mm,
+                diameter_px=2.0 * radius,
                 point_camera_m=point,
             ))
         return holes

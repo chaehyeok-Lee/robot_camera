@@ -47,6 +47,18 @@ def main() -> None:
     depth_sensor = profile.get_device().first_depth_sensor()
     if depth_sensor.supports(rs.option.visual_preset):
         depth_sensor.set_option(rs.option.visual_preset, 3)  # High Accuracy 프리셋 (정밀도 우선)
+    # IR 텍스처 프로젝터를 최대 출력으로 - 무광 검은 표면은 IR 반사가 약해서
+    # depth 노이즈/무효 비율이 높은데, 액티브 스테레오 프로젝터를 강하게 켜면
+    # 매칭용 텍스처가 늘어나 신호 품질이 개선된다.
+    try:
+        if depth_sensor.supports(rs.option.emitter_enabled):
+            depth_sensor.set_option(rs.option.emitter_enabled, 1.0)
+        if depth_sensor.supports(rs.option.laser_power):
+            max_power = depth_sensor.get_option_range(rs.option.laser_power).max
+            depth_sensor.set_option(rs.option.laser_power, max_power)
+            print(f"IR 프로젝터 활성화 (레이저 파워 {max_power:.0f})")
+    except RuntimeError as error:
+        print(f"IR 프로젝터 설정 실패 (일부 펌웨어는 스트리밍 중 변경 불가): {error}")
     depth_scale = depth_sensor.get_depth_scale()  # raw depth 값(uint16) -> 미터 환산 계수
 
     # depth를 color 카메라 시점으로 정렬 (두 센서 위치가 달라서 필요)
@@ -84,17 +96,15 @@ def main() -> None:
 
         debug = param["debug"]
         residual_note = ""
-        if debug is not None and debug.get("residual_mm") is not None:
+        if debug is not None and debug.get("depression") is not None:
             in_object = bool(debug["object_mask"][py, px] > 0)
-            residual_val = float(debug["residual_mm"][py, px])
-            kernel_px = debug.get("kernel_px")
+            # depression 인코딩은 1단위 ≈ 0.5mm (hole_detector._make_depression_image 참고)
+            depression_mm = float(debug["depression"][py, px]) / 2.0
             px_per_mm = debug.get("px_per_mm")
-            working_val = float(debug["working_mm"][py, px])
-            baseline_val = float(debug["baseline_mm"][py, px])
+            candidate_count = debug.get("candidate_count")
             residual_note = (
-                f"  residual={residual_val:.2f}mm  object_mask={'안' if in_object else '밖'}"
-                f"  kernel={kernel_px}px  px_per_mm={px_per_mm:.2f}"
-                f"  working={working_val:.1f}mm  baseline={baseline_val:.1f}mm"
+                f"  object_mask={'안' if in_object else '밖'}  depression≈{depression_mm:.2f}mm"
+                f"  px_per_mm={px_per_mm:.2f}  candidates={candidate_count}"
             )
 
         print(
@@ -106,23 +116,32 @@ def main() -> None:
     cv2.namedWindow("RGB + holes | Depth")
     cv2.setMouseCallback("RGB + holes | Depth", on_mouse, click_state)
 
-    def capture_averaged_depth(n_frames: int = 30) -> np.ndarray | None:
-        """[역할] n_frames만큼 depth를 모아 픽셀별 중앙값을 반환 - 단일 프레임의
-        랜덤 노이즈를 줄여서 얕은 홀(3mm급) 신호를 더 안정적으로 살리기 위함.
+    def capture_averaged(n_frames: int = 30) -> tuple[np.ndarray, np.ndarray] | None:
+        """[역할] n_frames만큼 depth+color를 모아 픽셀별 중앙값을 반환 - 단일 프레임의
+        랜덤 노이즈를 줄여서 얕은 홀(1~2mm급) 신호를 더 안정적으로 살리기 위함.
+        depth의 무효(0) 픽셀은 NaN으로 바꿔 nanmedian으로 제외한다 - 그냥 median을
+        쓰면 dropout(0)이 섞여 중앙값이 왜곡될 수 있다.
         캡처 도중 물체/카메라가 움직이면 오히려 결과가 흐려지므로 정지 상태 필요.
         """
-        stack = []
+        depth_stack, color_stack = [], []
         for _ in range(n_frames):
             frames = pipeline.wait_for_frames()
             frames = align.process(frames)
             depth_frame = frames.get_depth_frame()
-            if not depth_frame:
+            color_frame = frames.get_color_frame()
+            if not depth_frame or not color_frame:
                 continue
             depth_frame = temporal.process(depth_frame)
-            stack.append(np.asanyarray(depth_frame.get_data()).astype(np.float32))
-        if not stack:
+            depth_raw = np.asanyarray(depth_frame.get_data()).astype(np.float32)
+            depth_stack.append(np.where(depth_raw > 0, depth_raw, np.nan))
+            color_stack.append(np.asanyarray(color_frame.get_data()))
+        if not depth_stack:
             return None
-        return np.median(np.stack(stack, axis=0), axis=0) * depth_scale
+        with np.errstate(invalid="ignore"):
+            fused_depth = np.nanmedian(np.stack(depth_stack, axis=0), axis=0)
+        fused_depth = np.nan_to_num(fused_depth, nan=0.0) * depth_scale
+        fused_color = np.median(np.stack(color_stack, axis=0), axis=0).astype(np.uint8)
+        return fused_depth, fused_color
 
     def render(depth_m: np.ndarray, color_image: np.ndarray, holes: list, debug: dict, frozen: bool) -> None:
         """[역할] 한 프레임(실시간 또는 평균 캡처 결과)을 오버레이 그려서 창에 표시."""
@@ -146,10 +165,12 @@ def main() -> None:
         depth_vis = cv2.applyColorMap(
             cv2.convertScaleAbs(depth_m, alpha=255.0 / config.max_object_distance_m), cv2.COLORMAP_JET
         )
-        hole_mask_vis = cv2.cvtColor(debug["hole_mask"], cv2.COLOR_GRAY2BGR)
+        # depression: "국소 표면보다 얼마나 더 먼가"를 밝기로 표현한 디버그 이미지.
+        # 여기서 Hough Circle 후보를 찾으므로, 밝게 뭉친 부분이 곧 후보 위치다.
+        depression_vis = cv2.applyColorMap(debug["depression"], cv2.COLORMAP_TURBO)
 
         cv2.imshow("RGB + holes | Depth", np.hstack([display, depth_vis]))
-        cv2.imshow("Hole mask", hole_mask_vis)
+        cv2.imshow("Depth depression (Hough 입력)", depression_vis)
 
     print(
         "D435 hole inspection running. 'q' to quit, 's' to save, 'c' to capture "
@@ -178,10 +199,10 @@ def main() -> None:
             last_color = color_image
             click_state["depth_m"] = depth_m  # on_mouse가 최신 프레임을 읽도록 갱신
 
-            # 핵심 탐지 호출 (hole_detector.py)
-            holes, debug = detector.detect(depth_m)
+            # 핵심 탐지 호출 (hole_detector.py) - RGB(Hough용) + depth 둘 다 전달
+            holes, debug = detector.detect(color_image, depth_m)
             last_holes = holes  # 's' 키로 저장할 때 쓰기 위해 보관
-            click_state["debug"] = debug  # on_mouse가 residual/object_mask도 읽도록 갱신
+            click_state["debug"] = debug  # on_mouse가 object_mask/depression도 읽도록 갱신
 
             render(depth_m, color_image, holes, debug, frozen=False)
 
@@ -194,12 +215,14 @@ def main() -> None:
                 # --- 다중 프레임 평균 캡처: 물체를 고정한 채 노이즈를 줄여 재탐지 ---
                 while True:
                     print("30프레임 캡처 중... 물체/카메라를 움직이지 마세요.")
-                    avg_depth_m = capture_averaged_depth(n_frames=30)
-                    if avg_depth_m is None:
+                    captured = capture_averaged(n_frames=30)
+                    if captured is None:
                         print("캡처 실패 - 다시 시도하세요.")
                         break
-                    avg_holes, avg_debug = detector.detect(avg_depth_m)
+                    avg_depth_m, avg_color = captured
+                    avg_holes, avg_debug = detector.detect(avg_color, avg_depth_m)
                     last_holes = avg_holes
+                    last_color = avg_color
                     click_state["depth_m"] = avg_depth_m
                     click_state["debug"] = avg_debug
                     print(f"평균 캡처 완료 - 홀 {len(avg_holes)}개 탐지됨 (s로 저장, c로 재촬영, 다른 키는 실시간 복귀)")
