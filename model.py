@@ -13,7 +13,10 @@ JSON 파일로 저장.
 
 조작 (미리보기 창에 포커스가 있는 상태에서):
     q - 종료
-    s - 현재 프레임에서 탐지된 홀 좌표를 holes_<timestamp>.json으로 저장
+    s - 현재 탐지된 홀 좌표를 holes_<timestamp>.json으로 저장
+    c - 30프레임을 모아 중앙값으로 노이즈를 줄인 뒤 그 결과로 탐지 (검사용 안정된 판정).
+        캡처 중엔 물체/카메라를 움직이지 말 것. 결과 화면은 고정되며, 아무 키나
+        누르면 실시간 미리보기로 돌아감 (c/s/q는 각자 원래 동작 유지)
 """
 from __future__ import annotations
 
@@ -62,7 +65,7 @@ def main() -> None:
     # "저 물체가 카메라에서 몇 m 거리인지" 눈대중 대신 바로 재기 위한 디버그 도구.
     # 창은 [RGB | depth 컬러맵]을 가로로 붙여놨으니, 오른쪽 절반을 클릭해도
     # 같은 depth_m 배열에서 좌표만 옮겨서 읽는다.
-    click_state = {"depth_m": None}
+    click_state = {"depth_m": None, "debug": None, "last_click_raw": None, "last_click": None}
 
     def on_mouse(event, x, y, flags, param):
         if event != cv2.EVENT_LBUTTONDOWN or param["depth_m"] is None:
@@ -70,20 +73,90 @@ def main() -> None:
         depth_snapshot = param["depth_m"]
         height, width = depth_snapshot.shape
         px, py = (x - width if x >= width else x), y
+        param["last_click_raw"] = (x, y)  # cv2가 실제로 보고한 원본 좌표 (창 크기/DPI 확인용)
         if not (0 <= px < width and 0 <= py < height):
+            param["last_click"] = None
+            print(f"[클릭] 원본좌표=({x},{y})  -> 배열 범위 밖이라 무시됨 (이미지 크기 {width}x{height})")
             return
+        param["last_click"] = (px, py)
         d = float(depth_snapshot[py, px])
         in_band = config.min_object_distance_m < d < config.max_object_distance_m
+
+        debug = param["debug"]
+        residual_note = ""
+        if debug is not None and debug.get("residual_mm") is not None:
+            in_object = bool(debug["object_mask"][py, px] > 0)
+            residual_val = float(debug["residual_mm"][py, px])
+            kernel_px = debug.get("kernel_px")
+            px_per_mm = debug.get("px_per_mm")
+            working_val = float(debug["working_mm"][py, px])
+            baseline_val = float(debug["baseline_mm"][py, px])
+            residual_note = (
+                f"  residual={residual_val:.2f}mm  object_mask={'안' if in_object else '밖'}"
+                f"  kernel={kernel_px}px  px_per_mm={px_per_mm:.2f}"
+                f"  working={working_val:.1f}mm  baseline={baseline_val:.1f}mm"
+            )
+
         print(
             f"[클릭] pixel=({px},{py})  depth={d:.3f} m ({d * 1000:.0f} mm)  "
             f"{'범위 안' if in_band else '범위 밖'} (현재 설정 {config.min_object_distance_m}~{config.max_object_distance_m}m)"
+            f"{residual_note}"
         )
 
     cv2.namedWindow("RGB + holes | Depth")
     cv2.setMouseCallback("RGB + holes | Depth", on_mouse, click_state)
 
-    print("D435 hole inspection running. 'q' to quit, 's' to save detected coordinates, click preview to read depth.")
+    def capture_averaged_depth(n_frames: int = 30) -> np.ndarray | None:
+        """[역할] n_frames만큼 depth를 모아 픽셀별 중앙값을 반환 - 단일 프레임의
+        랜덤 노이즈를 줄여서 얕은 홀(3mm급) 신호를 더 안정적으로 살리기 위함.
+        캡처 도중 물체/카메라가 움직이면 오히려 결과가 흐려지므로 정지 상태 필요.
+        """
+        stack = []
+        for _ in range(n_frames):
+            frames = pipeline.wait_for_frames()
+            frames = align.process(frames)
+            depth_frame = frames.get_depth_frame()
+            if not depth_frame:
+                continue
+            depth_frame = temporal.process(depth_frame)
+            stack.append(np.asanyarray(depth_frame.get_data()).astype(np.float32))
+        if not stack:
+            return None
+        return np.median(np.stack(stack, axis=0), axis=0) * depth_scale
+
+    def render(depth_m: np.ndarray, color_image: np.ndarray, holes: list, debug: dict, frozen: bool) -> None:
+        """[역할] 한 프레임(실시간 또는 평균 캡처 결과)을 오버레이 그려서 창에 표시."""
+        display = color_image.copy()
+        for i, hole in enumerate(holes):
+            u, v = hole.pixel
+            cv2.circle(display, (u, v), max(3, int(hole.diameter_px / 2)), (0, 0, 255), 2)
+            cv2.putText(
+                display, f"#{i} d={hole.hole_depth_mm:.1f}mm", (u + 6, v - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1,
+            )
+        cv2.putText(display, f"holes: {len(holes)}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        if frozen:
+            cv2.putText(display, "AVERAGED (30f) - press any key for live, c to recapture",
+                        (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2)
+
+        if click_state["last_click"] is not None:
+            cx, cy = click_state["last_click"]
+            cv2.drawMarker(display, (cx, cy), (255, 0, 255), cv2.MARKER_CROSS, 20, 2)
+
+        depth_vis = cv2.applyColorMap(
+            cv2.convertScaleAbs(depth_m, alpha=255.0 / config.max_object_distance_m), cv2.COLORMAP_JET
+        )
+        hole_mask_vis = cv2.cvtColor(debug["hole_mask"], cv2.COLOR_GRAY2BGR)
+
+        cv2.imshow("RGB + holes | Depth", np.hstack([display, depth_vis]))
+        cv2.imshow("Hole mask", hole_mask_vis)
+
+    print(
+        "D435 hole inspection running. 'q' to quit, 's' to save, 'c' to capture "
+        "a 30-frame averaged (denoised) detection, click preview to read depth."
+    )
     last_holes: list = []
+    last_color: np.ndarray | None = None
     try:
         # --- 2. 메인 루프: 프레임마다 캡처 -> 정렬 -> 탐지 -> 시각화 ---
         while True:
@@ -94,43 +167,52 @@ def main() -> None:
             if not depth_frame or not color_frame:
                 continue
 
-            depth_frame = spatial.process(depth_frame)
+            # spatial filter는 3mm짜리 얕은 홀 신호까지 뭉개버리는 게 확인돼서 계속
+            # 끔. temporal filter는 같은 픽셀을 시간축으로만 평균내서 옆 픽셀(=홀
+            # 모양)을 섞지 않으므로 다시 사용.
+            # depth_frame = spatial.process(depth_frame)
             depth_frame = temporal.process(depth_frame)
 
             depth_m = np.asanyarray(depth_frame.get_data()).astype(np.float32) * depth_scale
             color_image = np.asanyarray(color_frame.get_data())
+            last_color = color_image
             click_state["depth_m"] = depth_m  # on_mouse가 최신 프레임을 읽도록 갱신
 
             # 핵심 탐지 호출 (hole_detector.py)
             holes, debug = detector.detect(depth_m)
             last_holes = holes  # 's' 키로 저장할 때 쓰기 위해 보관
+            click_state["debug"] = debug  # on_mouse가 residual/object_mask도 읽도록 갱신
 
-            # --- 3. 시각화: RGB 위에 탐지된 홀을 원+라벨로 표시 ---
-            display = color_image.copy()
-            for i, hole in enumerate(holes):
-                u, v = hole.pixel
-                cv2.circle(display, (u, v), max(3, int(hole.diameter_px / 2)), (0, 0, 255), 2)
-                cv2.putText(
-                    display, f"#{i} d={hole.hole_depth_mm:.1f}mm", (u + 6, v - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1,
-                )
-            cv2.putText(display, f"holes: {len(holes)}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-            # depth를 색으로 보여주는 창 (노이즈 수준/거리 튜닝할 때 참고용)
-            depth_vis = cv2.applyColorMap(
-                cv2.convertScaleAbs(depth_m, alpha=255.0 / config.max_object_distance_m), cv2.COLORMAP_JET
-            )
-            # 탐지 파이프라인 중간 산출물인 이진 홀 마스크 (디버깅용)
-            hole_mask_vis = cv2.cvtColor(debug["hole_mask"], cv2.COLOR_GRAY2BGR)
-
-            cv2.imshow("RGB + holes | Depth", np.hstack([display, depth_vis]))
-            cv2.imshow("Hole mask", hole_mask_vis)
+            render(depth_m, color_image, holes, debug, frozen=False)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
             if key == ord("s"):
                 save_holes(last_holes, camera_to_robot)
+            if key == ord("c"):
+                # --- 다중 프레임 평균 캡처: 물체를 고정한 채 노이즈를 줄여 재탐지 ---
+                while True:
+                    print("30프레임 캡처 중... 물체/카메라를 움직이지 마세요.")
+                    avg_depth_m = capture_averaged_depth(n_frames=30)
+                    if avg_depth_m is None:
+                        print("캡처 실패 - 다시 시도하세요.")
+                        break
+                    avg_holes, avg_debug = detector.detect(avg_depth_m)
+                    last_holes = avg_holes
+                    click_state["depth_m"] = avg_depth_m
+                    click_state["debug"] = avg_debug
+                    print(f"평균 캡처 완료 - 홀 {len(avg_holes)}개 탐지됨 (s로 저장, c로 재촬영, 다른 키는 실시간 복귀)")
+
+                    render(avg_depth_m, last_color, avg_holes, avg_debug, frozen=True)
+                    review_key = cv2.waitKey(0) & 0xFF
+                    if review_key == ord("q"):
+                        return
+                    if review_key == ord("s"):
+                        save_holes(last_holes, camera_to_robot)
+                    if review_key == ord("c"):
+                        continue  # 재촬영
+                    break  # 그 외 키 -> 실시간 루프로 복귀
     finally:
         pipeline.stop()
         cv2.destroyAllWindows()

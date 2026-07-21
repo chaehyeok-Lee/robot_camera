@@ -31,27 +31,27 @@ class HoleDetectorConfig:
     밖이고 카메라로 볼 대상이 아님 - 로봇이 11mm 입구 중심만 정확히 맞추면 됨).
     """
 
-    # 물체(타이어 출력물) 분리용 거리 범위 - 지금은 벽에 기댄 타이어를 약 1m
-    # 거리에서 촬영하는 임시 구도 기준 (아래 캡션 참고: 이 거리는 mm급 홀
-    # 탐지에 정확도가 부족해 임시값이며, 실제 검사 때는 카메라를 훨씬 가까이
-    # (0.3~0.5m) 옮기는 걸 강력 권장)
-    min_object_distance_m: float = 0.85
-    max_object_distance_m: float = 1.15
+    # 물체(타이어 출력물) 분리용 거리 범위 - 카메라를 타이어 정면 20~40cm로
+    # 옮긴 구도 기준. 이 정도 거리면 D435 depth 노이즈가 1mm 이하로 떨어져서
+    # 3mm짜리 홀 깊이와 노이즈가 잘 구분된다.
+    min_object_distance_m: float = 0.18
+    max_object_distance_m: float = 0.45
 
-    # 핀 머리가 들어가는 입구 지름 11mm 기준, 프린팅 오차/노이즈 대비 여유를 둠
-    min_hole_diameter_mm: float = 9.0
-    max_hole_diameter_mm: float = 13.0
+    # [진단용 임시값] min만 낮춰서 크기 필터를 느슨하게 함. max는 baseline
+    # 커널 크기 계산에도 쓰이므로 원래 스펙(11mm)에 가깝게 유지 - 20mm로
+    # 키우면 커널도 같이 커져서 baseline 추정 자체가 왜곡될 수 있음.
+    min_hole_diameter_mm: float = 3.0
+    max_hole_diameter_mm: float = 15.0
 
-    # 홀 바닥이 주변 표면(baseline)보다 최소 몇 mm 더 깊어야 "진짜 홀"로
-    # 인정할지. 실제 깊이는 3mm - 노이즈 여유를 두면서도 V자 트레드 홈의
-    # 얕은 굴곡과는 구분되도록 절반 정도인 1.5mm로 설정 (실측 후 튜닝 필요)
-    min_hole_depth_mm: float = 1.5
+    # 홀 바닥이 주변 표면(baseline)보다 몇 mm 더 깊어야 "진짜 홀"로 인정할지
+    # (하한/상한 둘 다). 실측으로는 진짜 홀이 1~2mm 범위로 관측되고, 그보다
+    # 큰 값(3mm+)은 V자 띠 등 다른 구조물일 가능성이 높아 상한으로 제외한다.
+    min_hole_depth_mm: float = 0.8
+    max_hole_depth_mm: float = 2.5
 
-    # 컨투어 원형도(4*pi*area/perimeter^2) 최소값. V자 트레드 문양도 depth
-    # residual을 만들어내지만 길쭉한 띠 모양이라 원형도가 낮음 - 이 값이
-    # "진짜 원형 홀 vs 트레드 문양"을 가르는 핵심 필터라 실측 데이터로
-    # 반드시 재확인/튜닝할 것
-    min_circularity: float = 0.55
+    # [진단용 임시값] 원래 0.55 -> 진짜 홀이 V자 띠와 맞닿아 있어서 컨투어가
+    # 합쳐지고 있는지 확인하려고 잠깐 낮춰놓음. 확인되면 다시 0.55 근처로 복구.
+    min_circularity: float = 0.3
 
     # baseline 표면 추정에 쓰는 morphology 커널 크기(px). 0이면 매 프레임마다
     # max_hole_diameter_mm과 현재 거리 기준 px/mm 스케일로 자동 계산.
@@ -147,8 +147,13 @@ class HoleDetector:
             fallback = max(cfg.min_hole_depth_mm * 3, float(np.max(residual_mm)) if residual_mm.size else 0.0)
             residual_mm[dropout] = fallback
 
-        # 잔차가 임계값 이상인 곳만 홀 마스크로 확정, 자잘한 노이즈는 열림 연산으로 제거
-        hole_mask = ((residual_mm >= cfg.min_hole_depth_mm) & (object_mask > 0)).astype(np.uint8) * 255
+        # 잔차가 [min, max] 범위 안일 때만 홀 마스크로 확정 (하한=노이즈 제외,
+        # 상한=V자 띠처럼 훨씬 깊은 다른 구조물 제외). 자잘한 노이즈는 열림 연산으로 제거
+        hole_mask = (
+            (residual_mm >= cfg.min_hole_depth_mm)
+            & (residual_mm <= cfg.max_hole_depth_mm)
+            & (object_mask > 0)
+        ).astype(np.uint8) * 255
         hole_mask = cv2.morphologyEx(hole_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
         holes = self._extract_holes(hole_mask, depth_m, residual_mm, px_per_mm)
@@ -157,6 +162,9 @@ class HoleDetector:
             "hole_mask": hole_mask,
             "residual_mm": residual_mm,
             "px_per_mm": px_per_mm,
+            "kernel_px": kernel_px,  # 진단용: baseline opening에 실제로 쓰인 커널 크기(px)
+            "working_mm": working,  # 진단용: object_mask 적용 후 실측 depth(mm)
+            "baseline_mm": baseline_mm,  # 진단용: opening으로 복원한 기준 표면(mm)
         }
         return holes, debug
 
