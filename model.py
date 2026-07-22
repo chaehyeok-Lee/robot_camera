@@ -142,6 +142,19 @@ def main() -> None:
             f"{residual_note}"
         )
 
+        # 진단: 이 픽셀을 실제 파이프라인과 완전히 같은 로직으로 검증했을 때
+        # 통과하는지, 안 하면 정확히 어느 단계에서 왜 떨어지는지 보여준다.
+        if debug is not None and debug.get("depth_mm") is not None:
+            diag = detector.diagnose(
+                px, py, debug["depth_mm"], debug["depression"], debug["object_mask"],
+                debug["object_bbox"], debug["lines"], radius=debug.get("default_radius_px"),
+            )
+            if diag.get("reject_reason") is None:
+                print(f"  [진단] 통과 (홀로 인정됨) - {diag}")
+            else:
+                print(f"  [진단] 탈락: {diag['reject_reason']}")
+                print(f"         상세: {diag}")
+
     cv2.namedWindow("RGB + holes | Depth")
     cv2.setMouseCallback("RGB + holes | Depth", on_mouse, click_state)
 

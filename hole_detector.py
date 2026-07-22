@@ -35,10 +35,11 @@ class HoleDetectorConfig:
     실제 residual이 1~2mm 정도로 관측된다.
     """
 
-    # 물체(타이어 출력물) 분리용 거리 범위 - 카메라를 타이어 정면 20~40cm로
-    # 옮긴 구도 기준. 패널이 넓어서(240x240mm) 좌우 끝이 중앙보다 살짝 멀거나
-    # 가까울 수 있어 여유를 좀 더 뒀다 (탐지 범위를 넓히기 위함).
-    min_object_distance_m: float = 0.15
+    # 물체(타이어 출력물) 분리용 거리 범위. distance_calibration.py 실측 결과
+    # 294mm보다 가까우면 D435 스테레오 시야 오버랩이 부족해져 유효 depth 자체가
+    # 급감했다(물리적 한계, 튜닝으로 해결 불가) - 하한을 그 실측값 기준으로 올림.
+    # 상한은 패널 좌우 끝이 중앙보다 살짝 멀 수 있어 여유를 뒀다.
+    min_object_distance_m: float = 0.28
     max_object_distance_m: float = 0.55
 
     # 트레드에서 가장 넓은 채널의 폭(mm) - tire_chevron_v4.stl 기준 V자/중앙
@@ -185,7 +186,7 @@ class HoleDetector:
         depression_mm[object_mask == 0] = 0
 
         return np.clip(depression_mm * 2.0, 0, 255).astype(np.uint8)
-
+    """8비트 이미지에서 원처럼 보이는 위치들 찾아 (x,y,r) 후보로 반환"""
     def _hough_candidates(
         self, image: np.ndarray, min_distance_px: float, min_radius_px: int, max_radius_px: int
     ) -> list[tuple[int, int, int]]:
@@ -341,84 +342,149 @@ class HoleDetector:
             "depression": depression,
             "candidate_count": len(unique_candidates),
             "px_per_mm": px_per_mm,
+            # 진단 도구(model.py 클릭 콜백)가 임의의 픽셀에 대해 왜 통과/탈락하는지
+            # 재계산 없이 바로 확인할 수 있도록 중간 산출물을 그대로 넘겨준다.
+            "depth_mm": depth_mm,
+            "lines": lines,
+            "object_bbox": object_bbox,
+            "default_radius_px": (min_radius_px + max_radius_px) // 2,
         }
         return holes, debug
 
     def _verify_candidates(self, candidates, depth_mm, depression, object_mask, object_bbox, lines):
+        holes: list[DetectedHole] = []
+        for x, y, radius in candidates:
+            hole, _diagnostics = self._evaluate_candidate(x, y, radius, depth_mm, depression, object_mask, object_bbox, lines)
+            if hole is not None:
+                holes.append(hole)
+        return holes
+
+    def diagnose(
+        self, x: int, y: int, depth_mm: np.ndarray, depression: np.ndarray,
+        object_mask: np.ndarray, object_bbox: tuple, lines, radius: int | None = None,
+    ) -> dict:
+        """[역할] 임의의 픽셀 하나가 왜 홀로 인정되는지/안 되는지 진단 정보를 반환한다
+        (model.py 클릭 디버그 도구용). `_verify_candidates`와 완전히 같은 판정
+        로직을 공유하므로(`_evaluate_candidate`), 실제 파이프라인과 다른 결과가
+        나올 걱정 없이 "이 자리는 왜 탈락했나"를 정확히 확인할 수 있다.
+        """
+        if radius is None:
+            radius = max(3, int(round((self.config.min_hole_diameter_mm + self.config.max_hole_diameter_mm)
+                                       / 4 * self._px_per_mm_from_depth(depth_mm, object_mask))))
+        _hole, diagnostics = self._evaluate_candidate(x, y, radius, depth_mm, depression, object_mask, object_bbox, lines)
+        return diagnostics
+
+    def _px_per_mm_from_depth(self, depth_mm: np.ndarray, object_mask: np.ndarray) -> float:
+        region = depth_mm[object_mask > 0]
+        median_depth_mm = float(np.median(region)) if region.size else 300.0
+        return self.intrinsics.fx / median_depth_mm
+
+    def _evaluate_candidate(self, x, y, radius, depth_mm, depression, object_mask, object_bbox, lines):
+        """[역할] 후보 하나를 검증해 (DetectedHole 또는 None, 진단 dict)를 반환한다.
+
+        진단 dict의 "reject_reason"에 어느 단계에서 왜 떨어졌는지 문자열로 남긴다 -
+        `_verify_candidates`(전체 파이프라인)와 `diagnose`(클릭 디버그) 양쪽에서
+        동일한 로직을 그대로 재사용한다.
+        """
         cfg = self.config
         height, width = depth_mm.shape
         bx, by, bw, bh = object_bbox
-        holes: list[DetectedHole] = []
-        for x, y, radius in candidates:
-            if not (0 <= x < width and 0 <= y < height) or object_mask[y, x] == 0:
-                continue
-            # 진짜 홀은 평평한 블록 중앙에 있어서 트레드 문양 선 위에 있을 수 없다 -
-            # depth 모양 판정과 무관한 독립적 소거 기준으로, 애매하게 통과한 채널
-            # 교차점 등을 추가로 걸러낸다.
-            if self._distance_to_nearest_line(lines, x, y) < radius * cfg.line_reject_radius_fraction:
-                continue
-            evidence = self._circle_depth_evidence(depth_mm, x, y, radius)
-            if evidence is None:
-                continue
-            recess_mm, invalid_fraction, ring_valid_fraction, sector_recesses, ring_depth_mm = evidence
+        diag: dict = {"pixel": (x, y), "radius_px": radius}
 
-            diameter_mm = (2.0 * radius * ring_depth_mm) / self.intrinsics.fx
-            if diameter_mm < cfg.min_hole_diameter_mm or diameter_mm > cfg.max_hole_diameter_mm * 1.5:
-                continue
-            if self._connects_to_outside_depression(depression, x, y, radius, cfg.connection_depth_mm):
-                continue
+        if not (0 <= x < width and 0 <= y < height) or object_mask[y, x] == 0:
+            diag["reject_reason"] = "물체(object_mask) 밖"
+            return None, diag
 
-            # "가장자리"는 화면(이미지) 기준이 아니라 물체(object_mask) 자체의 경계
-            # 기준으로 판단한다 - 화면 기준으로 하면 물체가 프레임 안 어디에 놓였는지에
-            # 따라 같은 물리적 위치가 다르게 취급돼서(예: 물체가 화면 하단에 걸치면
-            # 그 부분만 부당하게 완화됨), 완화가 물체 위치와 무관하게 일관되지 않았다.
-            edge_ratio = max(abs(x - (bx + bw / 2)) / (bw / 2), abs(y - (by + bh / 2)) / (bh / 2))
-            is_edge = edge_ratio >= 0.75  # 스테레오 매칭이 덜 완전한 물체 실제 테두리 근처만 완화
-            required_ring_valid = 0.55 if is_edge else 0.75
+        line_distance = self._distance_to_nearest_line(lines, x, y)
+        diag["line_distance_px"] = line_distance
+        if line_distance < radius * cfg.line_reject_radius_fraction:
+            diag["reject_reason"] = f"트레드 문양 선에 너무 가까움 (거리 {line_distance:.1f}px)"
+            return None, diag
 
-            if ring_valid_fraction < required_ring_valid:
-                continue
+        evidence = self._circle_depth_evidence(depth_mm, x, y, radius)
+        if evidence is None:
+            diag["reject_reason"] = "주변 링(ring) depth가 전부 무효"
+            return None, diag
+        recess_mm, invalid_fraction, ring_valid_fraction, sector_recesses, ring_depth_mm = evidence
+        diag.update(recess_mm=recess_mm, invalid_fraction=invalid_fraction, ring_valid_fraction=ring_valid_fraction)
 
-            # 실측 결과 진짜 홀의 residual 자체가 0~4.5mm로 5배 넘게 흔들려서, "몇 mm
-            # 이상 깊어야 한다"는 절대 크기 기준은 근본적으로 불안정하다. 대신 "모양이
-            # 둥근가"(=8방향이 서로 고르게 깊은가)로 판단을 바꾼다 - 홈(채널)은 지나가는
-            # 1~2방향만 깊고 나머지는 거의 0이라 편차가 크고, 진짜 원형 홀은 신호
-            # 세기와 무관하게 사방에서 고르게 깊다.
-            valid_sectors = sector_recesses[~np.isnan(sector_recesses)]
-            required_valid_sectors = 4 if is_edge else 6
-            if valid_sectors.size < required_valid_sectors:
-                continue
+        diameter_mm = (2.0 * radius * ring_depth_mm) / self.intrinsics.fx
+        diag["diameter_mm"] = diameter_mm
+        if diameter_mm < cfg.min_hole_diameter_mm or diameter_mm > cfg.max_hole_diameter_mm * 1.5:
+            diag["reject_reason"] = f"환산 지름 {diameter_mm:.1f}mm이 허용 범위 밖"
+            return None, diag
 
-            mean_recess = float(np.mean(valid_sectors))
-            positive_fraction = float(np.mean(valid_sectors > cfg.sector_positive_floor_mm))
-            uniformity_cv = float(np.std(valid_sectors) / (abs(mean_recess) + cfg.sector_positive_floor_mm))
+        if self._connects_to_outside_depression(depression, x, y, radius, cfg.connection_depth_mm):
+            diag["reject_reason"] = "깊은 영역이 반경 밖까지 이어짐 (그루브로 판단)"
+            return None, diag
 
-            required_positive_fraction = 0.5 if is_edge else cfg.min_sector_positive_fraction
-            max_uniformity_cv = cfg.max_sector_variation * (1.3 if is_edge else 1.0)
+        # "가장자리"는 화면(이미지) 기준이 아니라 물체(object_mask) 자체의 경계
+        # 기준으로 판단한다 - 화면 기준으로 하면 물체가 프레임 안 어디에 놓였는지에
+        # 따라 같은 물리적 위치가 다르게 취급돼서(예: 물체가 화면 하단에 걸치면
+        # 그 부분만 부당하게 완화됨), 완화가 물체 위치와 무관하게 일관되지 않았다.
+        edge_ratio = max(abs(x - (bx + bw / 2)) / (bw / 2), abs(y - (by + bh / 2)) / (bh / 2))
+        is_edge = edge_ratio >= 0.75  # 스테레오 매칭이 덜 완전한 물체 실제 테두리 근처만 완화
+        required_ring_valid = 0.55 if is_edge else 0.75
+        diag["is_edge"] = is_edge
 
-            accepted = (
-                recess_mm is not None
-                and cfg.min_hole_depth_mm <= mean_recess <= cfg.max_hole_depth_mm
-                and positive_fraction >= required_positive_fraction
-                and uniformity_cv <= max_uniformity_cv
-            )
-            # 아주 좁고 깊은 홀은 중심부 depth 측정 자체가 실패(무효)할 수 있다 -
-            # 그 경우 링이 충분히 유효하고 중심 무효 비율이 높으면 홀로 인정.
-            if not accepted and recess_mm is None:
-                accepted = invalid_fraction >= 0.65 and ring_valid_fraction >= (0.80 if is_edge else 0.95)
-            if not accepted:
-                continue
+        if ring_valid_fraction < required_ring_valid:
+            diag["reject_reason"] = f"링 유효 비율 {ring_valid_fraction:.2f} < 기준 {required_ring_valid}"
+            return None, diag
 
-            floor_depth_mm = ring_depth_mm + (recess_mm if recess_mm is not None else cfg.min_hole_depth_mm)
-            point = rs_deproject(self.intrinsics, x, y, floor_depth_mm / 1000.0)
-            holes.append(DetectedHole(
-                pixel=(x, y),
-                depth_m=floor_depth_mm / 1000.0,
-                hole_depth_mm=recess_mm if recess_mm is not None else cfg.min_hole_depth_mm,
-                diameter_px=2.0 * radius,
-                point_camera_m=point,
-            ))
-        return holes
+        # 실측 결과 진짜 홀의 residual 자체가 0~4.5mm로 5배 넘게 흔들려서, "몇 mm
+        # 이상 깊어야 한다"는 절대 크기 기준은 근본적으로 불안정하다. 대신 "모양이
+        # 둥근가"(=8방향이 서로 고르게 깊은가)로 판단을 바꾼다 - 홈(채널)은 지나가는
+        # 1~2방향만 깊고 나머지는 거의 0이라 편차가 크고, 진짜 원형 홀은 신호
+        # 세기와 무관하게 사방에서 고르게 깊다.
+        valid_sectors = sector_recesses[~np.isnan(sector_recesses)]
+        required_valid_sectors = 4 if is_edge else 6
+        diag["valid_sector_count"] = int(valid_sectors.size)
+        if valid_sectors.size < required_valid_sectors:
+            diag["reject_reason"] = f"유효 섹터 {valid_sectors.size}개 < 기준 {required_valid_sectors}"
+            return None, diag
+
+        mean_recess = float(np.mean(valid_sectors))
+        positive_fraction = float(np.mean(valid_sectors > cfg.sector_positive_floor_mm))
+        uniformity_cv = float(np.std(valid_sectors) / (abs(mean_recess) + cfg.sector_positive_floor_mm))
+        diag.update(mean_recess_mm=mean_recess, positive_fraction=positive_fraction, uniformity_cv=uniformity_cv)
+
+        required_positive_fraction = 0.5 if is_edge else cfg.min_sector_positive_fraction
+        max_uniformity_cv = cfg.max_sector_variation * (1.3 if is_edge else 1.0)
+        diag.update(required_positive_fraction=required_positive_fraction, max_uniformity_cv=max_uniformity_cv)
+
+        accepted = (
+            recess_mm is not None
+            and cfg.min_hole_depth_mm <= mean_recess <= cfg.max_hole_depth_mm
+            and positive_fraction >= required_positive_fraction
+            and uniformity_cv <= max_uniformity_cv
+        )
+        # 아주 좁고 깊은 홀은 중심부 depth 측정 자체가 실패(무효)할 수 있다 -
+        # 그 경우 링이 충분히 유효하고 중심 무효 비율이 높으면 홀로 인정.
+        if not accepted and recess_mm is None:
+            accepted = invalid_fraction >= 0.65 and ring_valid_fraction >= (0.80 if is_edge else 0.95)
+
+        if not accepted:
+            if recess_mm is None:
+                diag["reject_reason"] = "중심 depth 무효, 대체 조건도 불충족"
+            elif not (cfg.min_hole_depth_mm <= mean_recess <= cfg.max_hole_depth_mm):
+                diag["reject_reason"] = f"평균 recess {mean_recess:.2f}mm가 [{cfg.min_hole_depth_mm}, {cfg.max_hole_depth_mm}] 밖"
+            elif positive_fraction < required_positive_fraction:
+                diag["reject_reason"] = f"양의 방향 비율 {positive_fraction:.2f} < 기준 {required_positive_fraction}"
+            else:
+                diag["reject_reason"] = f"방향별 변동계수 {uniformity_cv:.2f} > 기준 {max_uniformity_cv:.2f} (모양이 안 둥긂)"
+            return None, diag
+
+        diag["reject_reason"] = None  # 통과
+        floor_depth_mm = ring_depth_mm + (recess_mm if recess_mm is not None else cfg.min_hole_depth_mm)
+        point = rs_deproject(self.intrinsics, x, y, floor_depth_mm / 1000.0)
+        hole = DetectedHole(
+            pixel=(x, y),
+            depth_m=floor_depth_mm / 1000.0,
+            hole_depth_mm=recess_mm if recess_mm is not None else cfg.min_hole_depth_mm,
+            diameter_px=2.0 * radius,
+            point_camera_m=point,
+        )
+        return hole, diag
 
 
 def rs_deproject(intrinsics, u: float, v: float, depth_m: float) -> np.ndarray:
