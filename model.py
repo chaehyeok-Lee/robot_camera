@@ -17,11 +17,19 @@ JSON 파일로 저장.
     c - 30프레임을 모아 중앙값으로 노이즈를 줄인 뒤 그 결과로 탐지 (검사용 안정된 판정).
         캡처 중엔 물체/카메라를 움직이지 말 것. 결과 화면은 고정되며, 아무 키나
         누르면 실시간 미리보기로 돌아감 (c/s/q는 각자 원래 동작 유지)
+    r - 실시간 화면의 안정화 트래커 초기화 (홀이 잘못 고정돼 안 없어질 때)
+
+실시간 화면의 빨간 원은 매 프레임 새로 계산한 게 아니라 두 겹으로 안정화된다:
+1) 최근 15프레임을 모아 픽셀별 중앙값으로 depth 노이즈를 줄인 뒤 그 결과로 탐지
+   (실측 결과 진짜 홀의 depth 신호가 프레임마다 0~2.5mm로 크게 흔들려서, 단일
+   프레임 판정으로는 임계값을 못 넘기는 경우가 많았다)
+2) 그 위에 HoleTracker로 몇 프레임 연속 잡혀야 화면에 나타나게 함
 """
 from __future__ import annotations
 
 import json
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -29,13 +37,34 @@ import numpy as np
 import pyrealsense2 as rs
 
 from calibration import load_camera_to_robot, transform_point
-from hole_detector import HoleDetector, HoleDetectorConfig
+from hole_detector import HoleDetector, HoleDetectorConfig, HoleTracker
 
 
 def main() -> None:
     config = HoleDetectorConfig()
     # 캘리브레이션 파일이 없으면 identity(카메라 좌표 그대로) - calibration.py 참고
     camera_to_robot = load_camera_to_robot()
+    # 매 프레임 독립 탐지 결과가 깜빡이지 않도록 안정화 - 여러 프레임 연속으로
+    # 잡혀야 화면에 표시되고, 잠깐 놓쳐도 바로 안 사라짐.
+    tracker = HoleTracker(confirm_frames=5, miss_tolerance=10)
+
+    # 실시간용 롤링 노이즈 감소 버퍼 - 단일 프레임 depth는 노이즈가 커서 진짜 홀
+    # 신호(1~2mm)가 프레임마다 0~2.5mm로 흔들리는 게 실측으로 확인됐다. 최근
+    # ROLLING_WINDOW개 프레임을 계속 모아 픽셀별 중앙값으로 판정하면 훨씬
+    # 안정적이다 (15프레임 = 약 0.5초 지연, 정지된 물체 검사라 문제없음).
+    ROLLING_WINDOW = 15
+    depth_history: deque = deque(maxlen=ROLLING_WINDOW)  # 원본(raw, 스케일 전) depth
+    color_history: deque = deque(maxlen=ROLLING_WINDOW)
+
+    def fuse_history() -> tuple[np.ndarray, np.ndarray] | None:
+        if not depth_history:
+            return None
+        stacked = np.stack([np.where(d > 0, d, np.nan) for d in depth_history], axis=0)
+        with np.errstate(invalid="ignore"):
+            fused_raw = np.nanmedian(stacked, axis=0)
+        fused_depth_m = np.nan_to_num(fused_raw, nan=0.0) * depth_scale
+        fused_color = np.median(np.stack(color_history, axis=0), axis=0).astype(np.uint8)
+        return fused_depth_m, fused_color
 
     # --- 1. RealSense 파이프라인 설정: depth + color 스트림 시작 ---
     pipeline = rs.pipeline()
@@ -174,7 +203,8 @@ def main() -> None:
 
     print(
         "D435 hole inspection running. 'q' to quit, 's' to save, 'c' to capture "
-        "a 30-frame averaged (denoised) detection, click preview to read depth."
+        "a 30-frame averaged (denoised) detection, 'r' to reset the live tracker, "
+        "click preview to read depth."
     )
     last_holes: list = []
     last_color: np.ndarray | None = None
@@ -194,23 +224,36 @@ def main() -> None:
             # depth_frame = spatial.process(depth_frame)
             depth_frame = temporal.process(depth_frame)
 
-            depth_m = np.asanyarray(depth_frame.get_data()).astype(np.float32) * depth_scale
+            depth_raw = np.asanyarray(depth_frame.get_data()).astype(np.float32)  # 스케일 전 원본 - 버퍼용
             color_image = np.asanyarray(color_frame.get_data())
-            last_color = color_image
-            click_state["depth_m"] = depth_m  # on_mouse가 최신 프레임을 읽도록 갱신
+            depth_history.append(depth_raw)
+            color_history.append(color_image)
+
+            # 최근 프레임들을 픽셀별 중앙값으로 합쳐 노이즈를 줄인 뒤 그걸로 탐지
+            depth_m, fused_color = fuse_history()
+            last_color = fused_color
+            click_state["depth_m"] = depth_m  # on_mouse가 최신(융합된) 프레임을 읽도록 갱신
 
             # 핵심 탐지 호출 (hole_detector.py) - RGB(Hough용) + depth 둘 다 전달
-            holes, debug = detector.detect(color_image, depth_m)
+            raw_holes, debug = detector.detect(fused_color, depth_m)
+            # 매 프레임 결과를 바로 쓰지 않고 트래커에 통과시켜 깜빡임을 없앤다 -
+            # 여러 프레임 연속으로 잡힌 것만 화면에 남고, 잠깐 놓쳐도 유지된다.
+            holes = tracker.update(raw_holes)
             last_holes = holes  # 's' 키로 저장할 때 쓰기 위해 보관
             click_state["debug"] = debug  # on_mouse가 object_mask/depression도 읽도록 갱신
 
-            render(depth_m, color_image, holes, debug, frozen=False)
+            render(depth_m, fused_color, holes, debug, frozen=False)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
             if key == ord("s"):
                 save_holes(last_holes, camera_to_robot)
+            if key == ord("r"):
+                tracker.clear()
+                depth_history.clear()
+                color_history.clear()
+                print("트래커 + 롤링 버퍼 초기화 - 안정화된 홀 목록을 비웠습니다.")
             if key == ord("c"):
                 # --- 다중 프레임 평균 캡처: 물체를 고정한 채 노이즈를 줄여 재탐지 ---
                 while True:

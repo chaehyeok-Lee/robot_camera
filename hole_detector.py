@@ -10,9 +10,12 @@
    "원형 후보"를 먼저 찾는다 (baseline 오염과 무관하게 동작).
 2. 각 후보마다 이미지 전체가 아니라 그 후보를 감싸는 **고리(ring) 영역**의 depth만
    참조값으로 써서 실제로 파여있는지 검증한다 (커널이 옆으로 새는 문제가 없음).
-3. 후보 주변을 8방향으로 나눠 "모든 방향에서 깊은지"를 확인한다 - 진짜 둥근 홀은
-   사방에서 깊고, 트레드 홈(V자 띠)은 홈이 지나가는 한두 방향에서만 깊으므로 이
-   차이로 확실하게 구분한다.
+3. 후보 주변을 8방향으로 나눠 "모양이 둥근가"(=8방향이 서로 고르게 깊은가)를
+   확인한다. 절대 깊이 크기가 아니라 방향별 균일성(변동계수)을 본다 - 실측 결과
+   진짜 홀도 residual이 0~4.5mm로 크게 흔들려서 "몇 mm 이상"이라는 절대 크기
+   기준은 근본적으로 불안정했다. 반면 진짜 둥근 홀은 신호 세기와 무관하게 사방에서
+   고르게 깊고, 트레드 홈(V자 띠)은 홈이 지나가는 한두 방향만 깊어 편차가 커서
+   이 차이로 구분한다.
 4. 후보의 깊은 영역이 반경 밖 그루브까지 이어지면(=홈의 일부) 제외한다.
 """
 from __future__ import annotations
@@ -33,32 +36,40 @@ class HoleDetectorConfig:
     """
 
     # 물체(타이어 출력물) 분리용 거리 범위 - 카메라를 타이어 정면 20~40cm로
-    # 옮긴 구도 기준.
-    min_object_distance_m: float = 0.18
-    max_object_distance_m: float = 0.45
+    # 옮긴 구도 기준. 패널이 넓어서(240x240mm) 좌우 끝이 중앙보다 살짝 멀거나
+    # 가까울 수 있어 여유를 좀 더 뒀다 (탐지 범위를 넓히기 위함).
+    min_object_distance_m: float = 0.15
+    max_object_distance_m: float = 0.55
 
     # 트레드에서 가장 넓은 채널의 폭(mm) - tire_chevron_v4.stl 기준 V자/중앙
     # 채널이 5mm로 가장 넓음. segment_object의 Closing 커널이 이보다 확실히
     # 커야 채널 때문에 블록들이 서로 다른 섬으로 갈라지지 않는다.
     max_channel_width_mm: float = 6.0
 
-    # 핀 머리가 들어가는 입구 지름 11mm 기준, 프린팅 오차 대비 여유
-    min_hole_diameter_mm: float = 9.0
-    max_hole_diameter_mm: float = 13.0
+    # 핀 머리가 들어가는 입구 지름 11mm 기준, 프린팅 오차 대비 여유 (탐지 범위를
+    # 넓히기 위해 살짝 더 여유를 둠 - 원 판정 자체는 hough_param2로 더 엄격해짐)
+    min_hole_diameter_mm: float = 8.0
+    max_hole_diameter_mm: float = 14.0
 
-    # 후보 중심이 주변 링보다 몇 mm 더 깊어야(=멀어야) "진짜 홀"로 인정할지
+    # 후보 중심이 주변 링보다 몇 mm 더 깊어야(=멀어야) "진짜 홀"로 인정할지.
+    # 실측 결과 진짜 홀인데도 최대 4.5mm까지 나오는 경우가 있어서 상한을 올림 -
+    # 채널(V자 홈)은 10mm급이라 6mm 이하로 잡아도 여전히 확실히 구분된다.
     min_hole_depth_mm: float = 0.8
-    max_hole_depth_mm: float = 2.5
+    max_hole_depth_mm: float = 6.0
 
     # Hough Circle 파라미터 (Canny 상위 임계값 / 누산기 임계값 - 낮을수록 후보가 늘어남).
-    # 우리 depression 이미지는 실측 신호가 약해서(1~2mm ≈ 밝기 2~4단계) 대비가 매우
-    # 낮다 - 원본(depth_v1.py 기본값 50/16)은 이 신호 세기에서 후보를 아예 못 찾아서
-    # 낮췄다. 후보가 늘어나는 대신 링/8섹터/연결성 검증 단계가 걸러낸다.
+    # param2를 올릴수록 "더 원에 가까운 모양"만 후보로 인정한다(더 엄격). 근본
+    # 버그(물체 분리/블러 sigma/필터)를 다 고친 뒤로는 대부분의 진짜 홀이 안정적인
+    # 원으로 검출돼서, 정확도를 위해 더 엄격하게 올렸다 - 대신 크기/거리 범위를
+    # 넓혀서(위 min/max_hole_diameter_mm, min/max_object_distance_m) 놓치는
+    # 홀이 없도록 보완했다.
     hough_param1: float = 10.0
-    hough_param2: float = 5.0
+    hough_param2: float = 11.0
 
-    # 후보 원 중심 사이 최소 간격(mm) - px는 매 프레임 거리로 자동 환산
-    min_candidate_distance_mm: float = 15.0
+    # 후보 원 중심 사이 최소 간격(mm) - px는 매 프레임 거리로 자동 환산.
+    # 홀 하나 주변에 잡음으로 여러 후보가 겹쳐서 중복/오탐지로 이어지는 걸 막기
+    # 위해 여유를 좀 더 뒀다 (실제 홀 간격은 리브 하나 폭 수준이라 25mm+로 안전).
+    min_candidate_distance_mm: float = 20.0
 
     # 국소 표면(baseline) 추정용 가우시안 블러의 sigma(px). 0이면 최대 홀 반지름의
     # 약 2.5배로 매 프레임 자동 계산 - 실측 검증 결과 sigma가 홀 반지름의 최소
@@ -71,9 +82,21 @@ class HoleDetectorConfig:
     # 일부로 보고 제외한다.
     connection_depth_mm: float = 1.0
 
-    # 8방향 섹터 중 몇 개 이상에서 깊어야 "둥근 홀"로 인정할지 (화면 중앙 기준,
-    # 가장자리는 스테레오 매칭 품질이 떨어져서 자동으로 완화됨)
-    required_deep_sectors: int = 5
+    # --- 8방향 섹터 모양(둥근가) 판정 기준 ---
+    # 진짜 홀의 residual 자체가 0~4.5mm로 크게 흔들려서, "몇 mm 이상"이라는 절대
+    # 크기 기준 대신 "8방향이 서로 고르게 깊은가"(모양)로 판정한다.
+    sector_positive_floor_mm: float = 0.3  # 이보다 커야 "그 방향도 파여있다"로 침
+    min_sector_positive_fraction: float = 0.6  # 유효 섹터 중 최소 이 비율은 파여있어야 함
+    max_sector_variation: float = 1.0  # 변동계수(표준편차/평균) 상한 - 낮을수록 균일(원형)
+
+    # 이 mm 길이 이상인 직선만 "트레드 문양 선"으로 인정한다 - 짧은 노이즈성
+    # 선 조각까지 선으로 잡으면, 그 근처의 무관한 진짜 홀까지 덩달아 제외된다.
+    min_line_length_mm: float = 12.0
+
+    # 후보 중심이 그 직선에 이 정도(반지름의 배수) 이내로 가까우면 제외한다 -
+    # depth 모양 판정과 무관한 독립적 소거 기준. 설계상 홀-채널 간 최소 7mm
+    # 클리어런스가 보장돼 있어서, 이 값을 타이트하게 잡아도 진짜 홀은 안 걸린다.
+    line_reject_radius_fraction: float = 0.3
 
 
 @dataclass
@@ -148,8 +171,16 @@ class HoleDetector:
         filled = np.where(valid, depth_mm, fill_value).astype(np.float32)
         filled = cv2.medianBlur(filled, 5)
 
-        kernel_px = int(6 * sigma_px + 1) | 1  # OpenCV 권장: 커널 >= 6*sigma+1
-        local_surface = cv2.GaussianBlur(filled, (kernel_px, kernel_px), sigma_px)
+        # 가우시안 블러는 "공간 거리"만 보고 섞기 때문에, 홀이든 채널(10mm급)이든
+        # 가까우면 다 같이 뭉갠다 - 그래서 채널 근처 진짜 홀의 baseline이 오염되는
+        # 문제가 있었다. 양방향 필터(bilateral)는 "공간 거리 + 값 차이"를 같이 봐서,
+        # sigma_color보다 값 차이가 큰 진짜 경계(채널)는 안 섞고 보존하면서 작은
+        # 차이(홀)만 지운다 - 홀 크기(<=max_hole_depth_mm)는 지우고 채널(~10mm)은
+        # 보존하도록 그 사이 값으로 sigma_color를 잡는다.
+        cfg = self.config
+        sigma_color_mm = cfg.max_hole_depth_mm + 2.0
+        diameter_px = min(int(6 * sigma_px + 1) | 1, 61)  # 성능을 위해 상한을 둠
+        local_surface = cv2.bilateralFilter(filled, diameter_px, sigma_color_mm, sigma_px)
         depression_mm = np.maximum(filled - local_surface, 0)
         depression_mm[object_mask == 0] = 0
 
@@ -236,6 +267,40 @@ class HoleDetector:
         centre_labels = centre_labels[centre_labels != 0]
         return any(np.any(labels[outside] == label) for label in centre_labels)
 
+    def _detect_lines(self, gray: np.ndarray, px_per_mm: float) -> np.ndarray | None:
+        """[역할] RGB(CLAHE 보정 흑백)에서 직선(트레드 문양 선) 구간을 찾는다.
+
+        진짜 홀은 평평한 블록 중앙에 있어서 이런 뚜렷한 직선 위에 있을 수 없다 -
+        depth 모양(원형도) 판정과 무관한, 완전히 독립적인 소거 기준이라 depth
+        판정이 애매하게 통과시킨 채널 교차점 등을 추가로 걸러낼 수 있다.
+
+        최소 길이를 실제 mm 기준으로 잡는다 - 짧은 노이즈성 선 조각까지 "트레드
+        문양 선"으로 오인하면, 그 근처의 무관한 진짜 홀까지 덩달아 제외돼버린다.
+        트레드 문양 선은 리브를 가로지르는 긴 선이라 최소 길이를 충분히 크게
+        잡아도 실제 문양 선은 여전히 잡힌다.
+        """
+        min_length_px = max(20, int(round(self.config.min_line_length_mm * px_per_mm)))
+        edges = cv2.Canny(gray, 50, 150)
+        return cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=30, minLineLength=min_length_px, maxLineGap=5)
+
+    @staticmethod
+    def _distance_to_nearest_line(lines: np.ndarray | None, x: float, y: float) -> float:
+        if lines is None:
+            return float("inf")
+        best = float("inf")
+        for line in lines:
+            x1, y1, x2, y2 = np.asarray(line).ravel()[:4]
+            dx, dy = x2 - x1, y2 - y1
+            length_sq = dx * dx + dy * dy
+            if length_sq == 0:
+                distance = float(np.hypot(x - x1, y - y1))
+            else:
+                t = max(0.0, min(1.0, ((x - x1) * dx + (y - y1) * dy) / length_sq))
+                proj_x, proj_y = x1 + t * dx, y1 + t * dy
+                distance = float(np.hypot(x - proj_x, y - proj_y))
+            best = min(best, distance)
+        return best
+
     def detect(self, color_bgr: np.ndarray, depth_m: np.ndarray):
         """[역할] 메인 파이프라인: 물체 분리 -> Hough로 원형 후보 검출(RGB+depth
         양쪽) -> 후보별 링/8섹터/연결성 검증 -> 3D 좌표 계산. (holes, debug) 반환.
@@ -259,6 +324,7 @@ class HoleDetector:
         gray = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2GRAY)
         gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
         gray = np.where(object_mask > 0, gray, 0).astype(np.uint8)
+        lines = self._detect_lines(gray, px_per_mm)  # 트레드 문양 선 - 후보가 그 위에 있으면 제외
 
         candidates = self._hough_candidates(depression, min_distance_px, min_radius_px, max_radius_px)
         candidates += self._hough_candidates(gray, min_distance_px, min_radius_px, max_radius_px)
@@ -268,7 +334,8 @@ class HoleDetector:
             if all((cx - ux) ** 2 + (cy - uy) ** 2 > (min(cr, ur) * 0.7) ** 2 for ux, uy, ur in unique_candidates):
                 unique_candidates.append((cx, cy, cr))
 
-        holes = self._verify_candidates(unique_candidates, depth_mm, depression, object_mask)
+        object_bbox = cv2.boundingRect(object_mask)  # (x, y, w, h) - 완화 기준의 "가장자리"는 이걸 기준으로 삼는다
+        holes = self._verify_candidates(unique_candidates, depth_mm, depression, object_mask, object_bbox, lines)
         debug = {
             "object_mask": object_mask,
             "depression": depression,
@@ -277,12 +344,18 @@ class HoleDetector:
         }
         return holes, debug
 
-    def _verify_candidates(self, candidates, depth_mm, depression, object_mask):
+    def _verify_candidates(self, candidates, depth_mm, depression, object_mask, object_bbox, lines):
         cfg = self.config
         height, width = depth_mm.shape
+        bx, by, bw, bh = object_bbox
         holes: list[DetectedHole] = []
         for x, y, radius in candidates:
             if not (0 <= x < width and 0 <= y < height) or object_mask[y, x] == 0:
+                continue
+            # 진짜 홀은 평평한 블록 중앙에 있어서 트레드 문양 선 위에 있을 수 없다 -
+            # depth 모양 판정과 무관한 독립적 소거 기준으로, 애매하게 통과한 채널
+            # 교차점 등을 추가로 걸러낸다.
+            if self._distance_to_nearest_line(lines, x, y) < radius * cfg.line_reject_radius_fraction:
                 continue
             evidence = self._circle_depth_evidence(depth_mm, x, y, radius)
             if evidence is None:
@@ -295,17 +368,40 @@ class HoleDetector:
             if self._connects_to_outside_depression(depression, x, y, radius, cfg.connection_depth_mm):
                 continue
 
-            edge_ratio = max(abs(x - width / 2) / (width / 2), abs(y - height / 2) / (height / 2))
-            is_edge = edge_ratio >= 0.60  # 화면 가장자리는 스테레오 매칭이 덜 완전해서 기준 완화
+            # "가장자리"는 화면(이미지) 기준이 아니라 물체(object_mask) 자체의 경계
+            # 기준으로 판단한다 - 화면 기준으로 하면 물체가 프레임 안 어디에 놓였는지에
+            # 따라 같은 물리적 위치가 다르게 취급돼서(예: 물체가 화면 하단에 걸치면
+            # 그 부분만 부당하게 완화됨), 완화가 물체 위치와 무관하게 일관되지 않았다.
+            edge_ratio = max(abs(x - (bx + bw / 2)) / (bw / 2), abs(y - (by + bh / 2)) / (bh / 2))
+            is_edge = edge_ratio >= 0.75  # 스테레오 매칭이 덜 완전한 물체 실제 테두리 근처만 완화
             required_ring_valid = 0.55 if is_edge else 0.75
-            required_sectors = 4 if is_edge else cfg.required_deep_sectors
-            required_depth = cfg.min_hole_depth_mm * (0.75 if is_edge else 1.0)
 
             if ring_valid_fraction < required_ring_valid:
                 continue
 
-            deep_sectors = int(np.count_nonzero(sector_recesses >= required_depth))
-            accepted = recess_mm is not None and recess_mm <= cfg.max_hole_depth_mm and deep_sectors >= required_sectors
+            # 실측 결과 진짜 홀의 residual 자체가 0~4.5mm로 5배 넘게 흔들려서, "몇 mm
+            # 이상 깊어야 한다"는 절대 크기 기준은 근본적으로 불안정하다. 대신 "모양이
+            # 둥근가"(=8방향이 서로 고르게 깊은가)로 판단을 바꾼다 - 홈(채널)은 지나가는
+            # 1~2방향만 깊고 나머지는 거의 0이라 편차가 크고, 진짜 원형 홀은 신호
+            # 세기와 무관하게 사방에서 고르게 깊다.
+            valid_sectors = sector_recesses[~np.isnan(sector_recesses)]
+            required_valid_sectors = 4 if is_edge else 6
+            if valid_sectors.size < required_valid_sectors:
+                continue
+
+            mean_recess = float(np.mean(valid_sectors))
+            positive_fraction = float(np.mean(valid_sectors > cfg.sector_positive_floor_mm))
+            uniformity_cv = float(np.std(valid_sectors) / (abs(mean_recess) + cfg.sector_positive_floor_mm))
+
+            required_positive_fraction = 0.5 if is_edge else cfg.min_sector_positive_fraction
+            max_uniformity_cv = cfg.max_sector_variation * (1.3 if is_edge else 1.0)
+
+            accepted = (
+                recess_mm is not None
+                and cfg.min_hole_depth_mm <= mean_recess <= cfg.max_hole_depth_mm
+                and positive_fraction >= required_positive_fraction
+                and uniformity_cv <= max_uniformity_cv
+            )
             # 아주 좁고 깊은 홀은 중심부 depth 측정 자체가 실패(무효)할 수 있다 -
             # 그 경우 링이 충분히 유효하고 중심 무효 비율이 높으면 홀로 인정.
             if not accepted and recess_mm is None:
@@ -330,3 +426,77 @@ def rs_deproject(intrinsics, u: float, v: float, depth_m: float) -> np.ndarray:
     import pyrealsense2 as rs
     point = rs.rs2_deproject_pixel_to_point(intrinsics, [float(u), float(v)], float(depth_m))
     return np.array(point, dtype=float)
+
+
+class HoleTracker:
+    """[역할] 프레임마다 다시 계산되는 홀 목록을, 화면에서 깜빡이지 않고 계속
+    타겟팅하는 것처럼 보이도록 안정화한다 (`depth_v1.py`의 HoleTracker 참고).
+
+    매 프레임 독립적으로 탐지하면 노이즈 때문에 원이 나타났다 사라졌다 하는데,
+    이 트래커는 "가까운 위치에 여러 프레임 연속으로 잡혀야" 화면에 내보내고,
+    잠깐 놓쳐도(`miss_tolerance`까지) 바로 사라지지 않게 유지한다.
+    """
+
+    def __init__(self, confirm_frames: int = 3, miss_tolerance: int = 10):
+        self.confirm_frames = confirm_frames
+        self.miss_tolerance = miss_tolerance
+        self._tracks: list[dict] = []
+
+    def clear(self) -> None:
+        self._tracks.clear()
+
+    def update(self, detections: list[DetectedHole]) -> list[DetectedHole]:
+        matched: set[int] = set()
+        for hole in detections:
+            x, y = hole.pixel
+            radius = hole.diameter_px / 2.0
+            best_index, best_distance = None, float("inf")
+            for index, track in enumerate(self._tracks):
+                if index in matched:
+                    continue
+                distance = float(np.hypot(x - track["x"], y - track["y"]))
+                # Hough 중심이 프레임마다 몇 px씩 흔들릴 수 있어서 표시 크기보다 넉넉하게 잡음
+                limit = max(14.0, max(radius, track["radius"]) * 1.3)
+                if distance < limit and distance < best_distance:
+                    best_index, best_distance = index, distance
+
+            if best_index is None:
+                self._tracks.append({
+                    "x": float(x), "y": float(y), "radius": radius,
+                    "hole": hole, "streak": 1, "misses": 0, "confirmed": False,
+                })
+                matched.add(len(self._tracks) - 1)
+                continue
+
+            track = self._tracks[best_index]
+            track["x"] = 0.75 * track["x"] + 0.25 * x
+            track["y"] = 0.75 * track["y"] + 0.25 * y
+            track["radius"] = 0.75 * track["radius"] + 0.25 * radius
+            track["hole"] = hole
+            track["streak"] += 1  # 연속 적중 횟수 - 한 번이라도 놓치면 0으로 끊김
+            track["misses"] = 0
+            if track["streak"] >= self.confirm_frames:
+                track["confirmed"] = True  # 한 번 확정되면 이후 잠깐 놓쳐도 유지
+            matched.add(best_index)
+
+        for index, track in enumerate(self._tracks):
+            if index not in matched:
+                track["misses"] += 1
+                track["streak"] = 0  # 놓친 순간 연속 기록 초기화 - 누적되던 버그 수정
+        self._tracks = [t for t in self._tracks if t["misses"] <= self.miss_tolerance]
+
+        # "confirmed"는 confirm_frames번 연속 적중해야만 True가 된다 (버그 수정 전에는
+        # 놓쳐도 안 끊기는 누적 카운터였어서, 시간이 지날수록 잡음이 어쩌다 쌓여
+        # 오탐지가 계속 늘어났다).
+        visible = [t for t in self._tracks if t["confirmed"]]
+        result = []
+        for track in visible:
+            hole = track["hole"]
+            result.append(DetectedHole(
+                pixel=(int(round(track["x"])), int(round(track["y"]))),
+                depth_m=hole.depth_m,
+                hole_depth_mm=hole.hole_depth_mm,
+                diameter_px=track["radius"] * 2.0,
+                point_camera_m=hole.point_camera_m,
+            ))
+        return result

@@ -19,6 +19,7 @@ Hough Circle로 원형 후보를 찾는 데 보조적으로 사용한다(아래 
 | `hole_detector.py` | 핵심 탐지 알고리즘 (`HoleDetector`, `HoleDetectorConfig`) |
 | `calibration.py` | 카메라 좌표 -> 로봇 베이스 좌표 변환 (`hand_eye_calibration.json` 로드) |
 | `hand_eye_calibration.example.json` | 핸드아이 캘리브레이션 결과 파일 형식 예시 + 동차좌표/캘리브레이션 절차 설명 |
+| `distance_calibration.py` | 거리별 depth 노이즈 실측 도구 - 클릭한 지점을 여러 거리에서 측정해 노이즈-거리 그래프를 그려줌 (최적 작업 거리 찾기용) |
 | `requirements.txt` | 의존 패키지 목록 |
 
 ## 설치 및 실행
