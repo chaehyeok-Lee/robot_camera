@@ -79,9 +79,19 @@ class HoleDetectorConfig:
     # residual이 실제보다 훨씬 작게 나옴).
     surface_blur_sigma_px: float = 0.0
 
+    # 양방향 필터(bilateral)의 sigma_color(mm) - 이보다 값 차이가 작은 경계는
+    # 지우고(=홀), 크면 보존한다(=채널). 실측+합성 테스트로 3.0mm 정도가 "홀
+    # 신호는 잘 지우면서 7mm 클리어런스 밖 채널 신호가 안 새어 들어오는" 균형점.
+    depression_sigma_color_mm: float = 3.0
+
     # 후보의 깊은 영역이 이 mm 임계값 기준으로 반경 밖까지 이어지면 그루브(홈)의
-    # 일부로 보고 제외한다.
-    connection_depth_mm: float = 1.0
+    # 일부로 보고 제외한다. 검사 반경(반지름의 1.75배)이 설계상 홀-채널 최소
+    # 클리어런스(7mm)보다 넓어서, 모든 진짜 홀이 이 반경 안에 근처 채널을 포함하게
+    # 된다 - 그래서 임계값을 홀 신호 세기(~4.5mm까지 관측됨)보다 확실히 높고
+    # 채널 깊이(~10mm)보다는 낮게 잡아, 홀 자신의 약한 신호는 이 검사에서 아예
+    # "깊은 영역"으로 안 잡히고 채널의 강한 신호만 잡히게 한다 (실측으로 확인된
+    # 오탐지 수정).
+    connection_depth_mm: float = 6.0
 
     # --- 8방향 섹터 모양(둥근가) 판정 기준 ---
     # 진짜 홀의 residual 자체가 0~4.5mm로 크게 흔들려서, "몇 mm 이상"이라는 절대
@@ -176,10 +186,14 @@ class HoleDetector:
         # 가까우면 다 같이 뭉갠다 - 그래서 채널 근처 진짜 홀의 baseline이 오염되는
         # 문제가 있었다. 양방향 필터(bilateral)는 "공간 거리 + 값 차이"를 같이 봐서,
         # sigma_color보다 값 차이가 큰 진짜 경계(채널)는 안 섞고 보존하면서 작은
-        # 차이(홀)만 지운다 - 홀 크기(<=max_hole_depth_mm)는 지우고 채널(~10mm)은
-        # 보존하도록 그 사이 값으로 sigma_color를 잡는다.
+        # 차이(홀)만 지운다. 설계상 홀-채널 클리어런스가 최소 7mm로 가까울 수
+        # 있어서, sigma_color를 너무 크게(예: max_hole_depth_mm 기준) 잡으면
+        # 채널 신호가 그 좁은 간격을 넘어 근처 홀의 baseline까지 새어 들어가
+        # 홀 신호 자체가 지워지는 문제가 실측+합성 테스트로 확인됐다 - 그래서
+        # 홀 신호(수 mm)는 잘 지우되 채널(10mm)과는 확실히 구분되는 낮은
+        # 고정값을 쓴다.
         cfg = self.config
-        sigma_color_mm = cfg.max_hole_depth_mm + 2.0
+        sigma_color_mm = cfg.depression_sigma_color_mm
         diameter_px = min(int(6 * sigma_px + 1) | 1, 61)  # 성능을 위해 상한을 둠
         local_surface = cv2.bilateralFilter(filled, diameter_px, sigma_color_mm, sigma_px)
         depression_mm = np.maximum(filled - local_surface, 0)
@@ -205,11 +219,15 @@ class HoleDetector:
             return []
         return [tuple(map(int, c)) for c in np.rint(circles[0]).astype(np.int32)]
 
-    def _circle_depth_evidence(self, depth_mm: np.ndarray, x: int, y: int, radius: int):
+    def _circle_depth_evidence(self, depth_mm: np.ndarray, object_mask: np.ndarray, x: int, y: int, radius: int):
         """[역할] 후보 원 하나를 감싸는 링(ring) 영역의 depth로 실제 함몰 여부를 검증.
 
         반환: (recess_mm 또는 None, 중심 무효 비율, 링 유효 비율, 8방향 섹터별
         recess 배열, 링 depth mm). 링 자체가 무효면 None.
+
+        object_mask로 배경(물체 밖)을 제외한다 - 안 그러면 물체 가장자리 근처의
+        홀은 링 일부가 훨씬 먼 배경까지 걸쳐서, 그 배경값이 안 걸러지고 섞여
+        recess가 수십 mm씩 잘못 계산되는 문제가 있었다 (실측으로 확인됨).
         """
         height, width = depth_mm.shape
         outer_radius = max(int(radius * 1.65), radius + 3)
@@ -223,6 +241,9 @@ class HoleDetector:
         inner = distance2 <= max(2, int(radius * 0.55)) ** 2
         ring = (distance2 >= int(radius * 1.10) ** 2) & (distance2 <= outer_radius ** 2)
         crop = depth_mm[top:bottom, left:right]
+        mask_crop = object_mask[top:bottom, left:right] > 0
+        inner = inner & mask_crop
+        ring = ring & mask_crop
 
         inner_values, ring_values = crop[inner], crop[ring]
         inner_depth = _valid_median(inner_values)
@@ -401,7 +422,7 @@ class HoleDetector:
             diag["reject_reason"] = f"트레드 문양 선에 너무 가까움 (거리 {line_distance:.1f}px)"
             return None, diag
 
-        evidence = self._circle_depth_evidence(depth_mm, x, y, radius)
+        evidence = self._circle_depth_evidence(depth_mm, object_mask, x, y, radius)
         if evidence is None:
             diag["reject_reason"] = "주변 링(ring) depth가 전부 무효"
             return None, diag
@@ -443,10 +464,15 @@ class HoleDetector:
             diag["reject_reason"] = f"유효 섹터 {valid_sectors.size}개 < 기준 {required_valid_sectors}"
             return None, diag
 
-        mean_recess = float(np.mean(valid_sectors))
+        # 평균/표준편차 대신 중앙값(median)/MAD(중앙값 기준 절대편차)를 쓴다 -
+        # 근처 채널 때문에 8방향 중 1~2방향만 오염되는 경우(실측으로 확인됨)에도
+        # 평균은 소수의 오염된 방향에 쉽게 끌려가지만, 중앙값은 절반 미만이 오염된
+        # 이상 영향을 안 받는다.
+        median_recess = float(np.median(valid_sectors))
         positive_fraction = float(np.mean(valid_sectors > cfg.sector_positive_floor_mm))
-        uniformity_cv = float(np.std(valid_sectors) / (abs(mean_recess) + cfg.sector_positive_floor_mm))
-        diag.update(mean_recess_mm=mean_recess, positive_fraction=positive_fraction, uniformity_cv=uniformity_cv)
+        mad = float(np.median(np.abs(valid_sectors - median_recess)))
+        uniformity_cv = mad / (abs(median_recess) + cfg.sector_positive_floor_mm)
+        diag.update(median_recess_mm=median_recess, positive_fraction=positive_fraction, uniformity_cv=uniformity_cv)
 
         required_positive_fraction = 0.5 if is_edge else cfg.min_sector_positive_fraction
         max_uniformity_cv = cfg.max_sector_variation * (1.3 if is_edge else 1.0)
@@ -454,7 +480,7 @@ class HoleDetector:
 
         accepted = (
             recess_mm is not None
-            and cfg.min_hole_depth_mm <= mean_recess <= cfg.max_hole_depth_mm
+            and cfg.min_hole_depth_mm <= median_recess <= cfg.max_hole_depth_mm
             and positive_fraction >= required_positive_fraction
             and uniformity_cv <= max_uniformity_cv
         )
@@ -466,8 +492,8 @@ class HoleDetector:
         if not accepted:
             if recess_mm is None:
                 diag["reject_reason"] = "중심 depth 무효, 대체 조건도 불충족"
-            elif not (cfg.min_hole_depth_mm <= mean_recess <= cfg.max_hole_depth_mm):
-                diag["reject_reason"] = f"평균 recess {mean_recess:.2f}mm가 [{cfg.min_hole_depth_mm}, {cfg.max_hole_depth_mm}] 밖"
+            elif not (cfg.min_hole_depth_mm <= median_recess <= cfg.max_hole_depth_mm):
+                diag["reject_reason"] = f"중앙값 recess {median_recess:.2f}mm가 [{cfg.min_hole_depth_mm}, {cfg.max_hole_depth_mm}] 밖"
             elif positive_fraction < required_positive_fraction:
                 diag["reject_reason"] = f"양의 방향 비율 {positive_fraction:.2f} < 기준 {required_positive_fraction}"
             else:
