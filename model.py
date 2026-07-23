@@ -114,7 +114,8 @@ def main() -> None:
     # "저 물체가 카메라에서 몇 m 거리인지" 눈대중 대신 바로 재기 위한 디버그 도구.
     # 창은 [RGB | depth 컬러맵]을 가로로 붙여놨으니, 오른쪽 절반을 클릭해도
     # 같은 depth_m 배열에서 좌표만 옮겨서 읽는다.
-    click_state = {"depth_m": None, "debug": None, "last_click_raw": None, "last_click": None}
+    click_state = {"depth_m": None, "debug": None, "last_click_raw": None, "last_click": None, "stud_mode": False}
+    STUD_STATUS_LABEL = {"correct": "정확", "tilted": "틀어짐", "under_inserted": "덜박힘", "unknown": "불명"}
 
     def on_mouse(event, x, y, flags, param):
         if event != cv2.EVENT_LBUTTONDOWN or param["depth_m"] is None:
@@ -149,6 +150,22 @@ def main() -> None:
             f"{'범위 안' if in_band else '범위 밖'} (현재 설정 {config.min_object_distance_m}~{config.max_object_distance_m}m)"
             f"{residual_note}"
         )
+
+        # 스터드 검사 모드일 땐 "빈 홀" 기준(diagnose)이 아니라 스터드 상태
+        # 분류(classify_stud_state)를 보여줘야 한다 - 이미 스터드가 박힌
+        # 자리는 diagnose()의 recess/reject_reason이 애초에 잘못된 질문이라
+        # (예: recess가 여전히 커도 그게 "튼튼히 안 박힘"인지 "실수로 신호가
+        # 남은 빈 홀"인지 diagnose는 구분 못 함).
+        if param.get("stud_mode") and debug is not None and debug.get("depth_mm") is not None:
+            radius = debug.get("default_radius_px") or 16
+            state = detector.classify_stud_state(debug["depth_mm"], debug["object_mask"], px, py, radius)
+            label = STUD_STATUS_LABEL[state.status]
+            offset_text = "-" if state.seating_offset_mm is None else f"{state.seating_offset_mm:.2f}mm"
+            print(
+                f"  [스터드 진단] {label}  seating_offset={offset_text}  "
+                f"tilt_amplitude={state.tilt_amplitude_mm:.2f}mm  tilt_r2={state.tilt_r2:.2f}"
+            )
+            return
 
         # 진단: 이 픽셀을 실제 파이프라인과 완전히 같은 로직으로 검증했을 때
         # 통과하는지, 안 하면 정확히 어느 단계에서 왜 떨어지는지 보여준다.
@@ -305,6 +322,8 @@ def main() -> None:
             if not stud_mode:
                 last_holes = holes  # 's' 키로 저장 + 'i' 스냅샷용으로 보관 (스터드 검사 중엔 갱신 안 함)
             click_state["debug"] = debug  # on_mouse가 object_mask/depression도 읽도록 갱신
+
+            click_state["stud_mode"] = stud_mode  # on_mouse가 클릭 시 진단 종류(홀 vs 스터드)를 고르도록 갱신
 
             stud_states = None
             if stud_mode and stud_targets:
