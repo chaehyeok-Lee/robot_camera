@@ -46,13 +46,15 @@ def main() -> None:
     camera_to_robot = load_camera_to_robot()
     # 매 프레임 독립 탐지 결과가 깜빡이지 않도록 안정화 - 여러 프레임 연속으로
     # 잡혀야 화면에 표시되고, 잠깐 놓쳐도 바로 안 사라짐.
-    tracker = HoleTracker(confirm_frames=5, miss_tolerance=10)
+    tracker = HoleTracker(confirm_frames=3, miss_tolerance=5)
 
     # 실시간용 롤링 노이즈 감소 버퍼 - 단일 프레임 depth는 노이즈가 커서 진짜 홀
     # 신호(1~2mm)가 프레임마다 0~2.5mm로 흔들리는 게 실측으로 확인됐다. 최근
     # ROLLING_WINDOW개 프레임을 계속 모아 픽셀별 중앙값으로 판정하면 훨씬
-    # 안정적이다 (15프레임 = 약 0.5초 지연, 정지된 물체 검사라 문제없음).
-    ROLLING_WINDOW = 15
+    # 안정적이다. 15프레임은 매 프레임 nanmedian 연산 부하가 커서 프레임이
+    # 밀리는 문제가 있어 10으로 낮춤 (약 0.3초 지연, 노이즈 감소 효과는 약간
+    # 줄지만 정지된 물체 검사라 문제없음).
+    ROLLING_WINDOW = 10
     depth_history: deque = deque(maxlen=ROLLING_WINDOW)  # 원본(raw, 스케일 전) depth
     color_history: deque = deque(maxlen=ROLLING_WINDOW)
 
@@ -147,7 +149,8 @@ def main() -> None:
         if debug is not None and debug.get("depth_mm") is not None:
             diag = detector.diagnose(
                 px, py, debug["depth_mm"], debug["depression"], debug["object_mask"],
-                debug["object_bbox"], debug["lines"], radius=debug.get("default_radius_px"),
+                debug["object_bbox"], debug["lines"], gray_raw=debug.get("gray_raw"),
+                radius=debug.get("default_radius_px"),
             )
             if diag.get("reject_reason") is None:
                 print(f"  [진단] 통과 (홀로 인정됨) - {diag}")

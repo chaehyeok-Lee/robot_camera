@@ -109,6 +109,32 @@ class HoleDetectorConfig:
     # 클리어런스가 보장돼 있어서, 이 값을 타이트하게 잡아도 진짜 홀은 안 걸린다.
     line_reject_radius_fraction: float = 0.3
 
+    # 트레드 문양 선 검출/제외 기능 자체를 켤지 여부 - 연산 비용 대비 효과를
+    # 확인하려고 임시로 끌 수 있게 함. 꺼도 나머지(링/8섹터/그루브 연결성)
+    # 검증은 그대로 동작한다.
+    enable_line_rejection: bool = False
+
+    # --- 추가 후보 검출 방식 (Hough Circle 두 개에 더해서) ---
+    # LoG(Laplacian of Gaussian): 테두리(엣지)가 아니라 "정해진 크기의 둥근
+    # 덩어리 자체"를 직접 찾는다 - depression 신호의 테두리가 흐릿해도 덩어리
+    # 존재 자체는 잡아낼 수 있어서 Hough가 놓치는 후보를 보완한다.
+    enable_log_candidates: bool = True
+
+    # 템플릿 매칭: 이번 프레임에서 이미 검증된 홀 하나를 템플릿으로 잘라, 화면
+    # 전체에서 그것과 닮은 자리를 추가로 찾는다. Hough/LoG처럼 모양(엣지/블롭)에
+    # 기대는 게 아니라 "이미 확인된 진짜 홀과 얼마나 닮았는가"라는 별개 기준.
+    enable_template_matching: bool = True
+    template_match_threshold: float = 0.5  # 정규화 상관계수 최소값
+
+    # --- RGB 그림자/하이라이트 비대칭 검사 ---
+    # 조명이 한 방향에서 오면, 진짜 3D 오목한 홀은 한쪽은 그늘지고 반대쪽은
+    # 밝아지는 매끈한 방향성 패턴이 생긴다 (평면에 인쇄된 무늬는 이런 패턴이
+    # 없다). 8방향 평균 밝기에 코사인 하나를 맞춰서 그 적합도(R^2)를 점수로
+    # 쓴다. 아직 실측으로 임계값을 검증하지 않아서 기본은 점수만 진단에 남기고
+    # 판정에는 반영하지 않는다 - True로 켜면 min_shadow_highlight_r2 미만은 제외.
+    enable_shadow_highlight_check: bool = False
+    min_shadow_highlight_r2: float = 0.3
+
 
 @dataclass
 class DetectedHole:
@@ -219,6 +245,88 @@ class HoleDetector:
             return []
         return [tuple(map(int, c)) for c in np.rint(circles[0]).astype(np.int32)]
 
+    @staticmethod
+    def _greedy_nms(
+        points: np.ndarray, scores: np.ndarray, min_distance_px: float, max_candidates: int = 300
+    ) -> list[tuple[int, int]]:
+        """[역할] 점수 높은 순으로 정렬해서, 이미 뽑힌 점들과 min_distance_px보다
+        가까우면 버리는 탐욕적 비최대억제(greedy NMS).
+
+        `response == maximum_filter(response)` 방식은 평평하거나 값이 같은
+        구간(플래토)에서 그 구간 전체가 "극댓값"으로 잡혀버리는 문제가 있었다
+        (실측 아닌 균일한 배경에서 후보가 수천 개로 폭증하는 걸로 확인됨) -
+        점수 정렬 + 거리 기반 억제는 이 문제가 없다.
+        """
+        if points.shape[0] == 0:
+            return []
+        order = np.argsort(-scores)
+        if order.size > max_candidates:
+            order = order[:max_candidates]  # 성능 보호용 상한
+        kept: list[tuple[int, int]] = []
+        for index in order:
+            x, y = int(points[index, 0]), int(points[index, 1])
+            if all((x - kx) ** 2 + (y - ky) ** 2 >= min_distance_px ** 2 for kx, ky in kept):
+                kept.append((x, y))
+        return kept
+
+    def _log_candidates(
+        self, image: np.ndarray, object_mask: np.ndarray, radius_px: int, min_distance_px: float
+    ) -> list[tuple[int, int, int]]:
+        """[역할] LoG(Laplacian of Gaussian)로 지정한 반지름 크기의 둥근 밝은
+        덩어리를 직접 찾는다. Hough Circle은 "테두리(엣지)"가 뚜렷해야 잡히는데,
+        depression 신호가 약해서 테두리가 흐릿한 경우에도 "그 자리에 덩어리
+        자체가 있다"는 신호는 LoG로 잡힐 수 있어 Hough의 보완책이 된다.
+        """
+        sigma = max(1.0, radius_px / np.sqrt(2.0))  # 표준 LoG 블롭-반지름 관계
+        smoothed = cv2.GaussianBlur(image.astype(np.float32), (0, 0), sigmaX=sigma)
+        log = cv2.Laplacian(smoothed, cv2.CV_32F, ksize=3)
+        response = -log * (sigma ** 2)  # 스케일 정규화, 밝은 덩어리(=홀) -> 양수 피크
+        response[object_mask == 0] = 0
+
+        positive = response[response > 0]
+        if positive.size == 0:
+            return []
+        threshold = max(2.0, float(np.percentile(positive, 90)))
+        ys, xs = np.nonzero(response > threshold)
+        if xs.size == 0:
+            return []
+        points = np.column_stack([xs, ys])
+        scores = response[ys, xs]
+        kept = self._greedy_nms(points, scores, min_distance_px)
+        return [(x, y, radius_px) for x, y in kept]
+
+    def _template_candidates(
+        self, gray: np.ndarray, reference_holes: list["DetectedHole"], radius_px: int,
+        threshold: float, min_distance_px: float,
+    ) -> list[tuple[int, int, int]]:
+        """[역할] 이미 검증된 진짜 홀 하나를 템플릿으로 잘라, 화면 전체에서 그와
+        닮은 자리를 정규화 상관계수(cv2.TM_CCOEFF_NORMED)로 추가 검색한다.
+        Hough/LoG가 모양(엣지/블롭)에 기대는 것과 달리 "이미 확인된 진짜 홀과
+        얼마나 닮았는가"라는 완전히 다른 기준으로 후보를 낸다.
+        """
+        if not reference_holes:
+            return []
+        hx, hy = reference_holes[0].pixel
+        r = max(4, int(radius_px))
+        x0, y0, x1, y1 = hx - r, hy - r, hx + r, hy + r
+        if x0 < 0 or y0 < 0 or x1 >= gray.shape[1] or y1 >= gray.shape[0]:
+            return []
+        template = gray[y0:y1, x0:x1]
+        if template.size == 0 or template.shape[0] < 3 or template.shape[1] < 3:
+            return []
+
+        result = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
+        ys, xs = np.nonzero(result >= threshold)
+        if xs.size == 0:
+            return []
+        # matchTemplate 결과의 (x,y)는 템플릿의 좌상단 기준이라, 중심 좌표로 되돌리려면
+        # 템플릿 반폭(r)만큼 더해야 한다. 상관계수가 높은 진짜 매칭 주변엔 픽셀 수십 개가
+        # 다 threshold를 넘기기 때문에(부드러운 상관 곡면), NMS로 하나만 남긴다.
+        points = np.column_stack([xs + r, ys + r])
+        scores = result[ys, xs]
+        kept = self._greedy_nms(points, scores, min_distance_px)
+        return [(x, y, radius_px) for x, y in kept]
+
     def _circle_depth_evidence(self, depth_mm: np.ndarray, object_mask: np.ndarray, x: int, y: int, radius: int):
         """[역할] 후보 원 하나를 감싸는 링(ring) 영역의 depth로 실제 함몰 여부를 검증.
 
@@ -289,6 +397,54 @@ class HoleDetector:
         centre_labels = centre_labels[centre_labels != 0]
         return any(np.any(labels[outside] == label) for label in centre_labels)
 
+    def _shadow_highlight_r2(self, gray_raw: np.ndarray, x: int, y: int, radius: int) -> float:
+        """[역할] 조명이 한 방향에서 올 때 진짜 오목한 홀에 생기는 "한쪽은 그늘,
+        반대쪽은 밝음"이라는 매끈한 방향성 패턴을 점수화한다.
+
+        후보를 감싸는 고리를 8방향으로 나눠 평균 밝기를 구하고, 그 8개 값에
+        코사인 하나(단일 방향광 모델: 밝기 ≈ a + b·cos(각도-위상))를 최소자승으로
+        맞춘 뒤 적합도(R^2, 0~1)를 반환한다. 평면에 인쇄된 무늬는 이런 매끈한
+        방향성 그라데이션이 생기지 않아 R^2가 낮게 나오는 경향이 있다.
+
+        CLAHE 보정 이미지가 아니라 원본 밝기(gray_raw)를 써야 한다 - CLAHE는
+        타일 단위로 대비를 늘려서, 작은 홀이 타일 경계에 걸치면 인위적인 밝기
+        단차가 생겨 그라데이션 측정을 왜곡할 수 있다.
+        """
+        height, width = gray_raw.shape
+        outer_radius = max(int(radius * 1.5), radius + 3)
+        left, right = max(0, x - outer_radius), min(width, x + outer_radius + 1)
+        top, bottom = max(0, y - outer_radius), min(height, y + outer_radius + 1)
+        if right - left < 3 or bottom - top < 3:
+            return 0.0
+
+        yy, xx = np.ogrid[top:bottom, left:right]
+        distance2 = (xx - x) ** 2 + (yy - y) ** 2
+        ring = (distance2 >= max(2, int(radius * 0.6)) ** 2) & (distance2 <= outer_radius ** 2)
+        angle = np.arctan2(yy - y, xx - x)
+        crop = gray_raw[top:bottom, left:right].astype(np.float32)
+
+        means, angles = [], []
+        for sector in range(8):
+            lower = -np.pi + sector * (np.pi / 4)
+            upper = lower + np.pi / 4
+            values = crop[ring & (angle >= lower) & (angle < upper)]
+            if values.size:
+                means.append(float(np.mean(values)))
+                angles.append(lower + np.pi / 8)
+        if len(means) < 6:
+            return 0.0
+
+        means_arr = np.array(means)
+        angles_arr = np.array(angles)
+        design = np.column_stack([np.ones_like(angles_arr), np.cos(angles_arr), np.sin(angles_arr)])
+        coeffs, *_ = np.linalg.lstsq(design, means_arr, rcond=None)
+        predicted = design @ coeffs
+        residual_ss = float(np.sum((means_arr - predicted) ** 2))
+        total_ss = float(np.sum((means_arr - np.mean(means_arr)) ** 2))
+        if total_ss < 1e-6:
+            return 0.0
+        return max(0.0, 1.0 - residual_ss / total_ss)
+
     def _detect_lines(self, gray: np.ndarray, px_per_mm: float) -> np.ndarray | None:
         """[역할] RGB(CLAHE 보정 흑백)에서 직선(트레드 문양 선) 구간을 찾는다.
 
@@ -342,14 +498,20 @@ class HoleDetector:
         sigma_px = cfg.surface_blur_sigma_px or (max_radius_px * 2.5)
 
         depression = self._make_depression_image(depth_mm, object_mask, sigma_px)
+        default_radius_px = (min_radius_px + max_radius_px) // 2
 
-        gray = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2GRAY)
-        gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+        gray_raw = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2GRAY)  # 그림자/하이라이트 점수용 (CLAHE 전)
+        gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray_raw)
         gray = np.where(object_mask > 0, gray, 0).astype(np.uint8)
-        lines = self._detect_lines(gray, px_per_mm)  # 트레드 문양 선 - 후보가 그 위에 있으면 제외
+        # 트레드 문양 선 검출 - 연산 비용 대비 효과 비교를 위해 임시로 끌 수 있음
+        lines = self._detect_lines(gray, px_per_mm) if cfg.enable_line_rejection else None
 
         candidates = self._hough_candidates(depression, min_distance_px, min_radius_px, max_radius_px)
         candidates += self._hough_candidates(gray, min_distance_px, min_radius_px, max_radius_px)
+        if cfg.enable_log_candidates:
+            # LoG는 Hough와 달리 테두리가 아니라 "그 크기의 둥근 덩어리 자체"를
+            # 찾으므로 단일 대표 반지름(min~max 중간값)으로 한 번만 돈다.
+            candidates += self._log_candidates(depression, object_mask, default_radius_px, min_distance_px)
 
         unique_candidates: list[tuple[int, int, int]] = []
         for cx, cy, cr in candidates:
@@ -357,7 +519,24 @@ class HoleDetector:
                 unique_candidates.append((cx, cy, cr))
 
         object_bbox = cv2.boundingRect(object_mask)  # (x, y, w, h) - 완화 기준의 "가장자리"는 이걸 기준으로 삼는다
-        holes = self._verify_candidates(unique_candidates, depth_mm, depression, object_mask, object_bbox, lines)
+        holes = self._verify_candidates(unique_candidates, depth_mm, depression, object_mask, object_bbox, lines, gray_raw)
+
+        # 템플릿 매칭 2차 패스: 1차에서 홀이 하나라도 확정됐으면, 그걸 템플릿으로
+        # 잘라서 화면 전체에서 닮은 자리를 추가로 찾는다 (Hough/LoG가 놓친 후보 보완).
+        if cfg.enable_template_matching and holes:
+            template_candidates = self._template_candidates(
+                gray, holes, default_radius_px, cfg.template_match_threshold, min_distance_px
+            )
+            existing = [(h.pixel[0], h.pixel[1], int(h.diameter_px / 2)) for h in holes]
+            new_unique: list[tuple[int, int, int]] = []
+            for cx, cy, cr in template_candidates:
+                if all((cx - ux) ** 2 + (cy - uy) ** 2 > (min(cr, ur) * 0.7) ** 2 for ux, uy, ur in existing + new_unique):
+                    new_unique.append((cx, cy, cr))
+            if new_unique:
+                extra_holes = self._verify_candidates(new_unique, depth_mm, depression, object_mask, object_bbox, lines, gray_raw)
+                holes = holes + extra_holes
+                unique_candidates = unique_candidates + new_unique
+
         debug = {
             "object_mask": object_mask,
             "depression": depression,
@@ -368,21 +547,25 @@ class HoleDetector:
             "depth_mm": depth_mm,
             "lines": lines,
             "object_bbox": object_bbox,
-            "default_radius_px": (min_radius_px + max_radius_px) // 2,
+            "default_radius_px": default_radius_px,
+            "gray_raw": gray_raw,
         }
         return holes, debug
 
-    def _verify_candidates(self, candidates, depth_mm, depression, object_mask, object_bbox, lines):
+    def _verify_candidates(self, candidates, depth_mm, depression, object_mask, object_bbox, lines, gray_raw):
         holes: list[DetectedHole] = []
         for x, y, radius in candidates:
-            hole, _diagnostics = self._evaluate_candidate(x, y, radius, depth_mm, depression, object_mask, object_bbox, lines)
+            hole, _diagnostics = self._evaluate_candidate(
+                x, y, radius, depth_mm, depression, object_mask, object_bbox, lines, gray_raw
+            )
             if hole is not None:
                 holes.append(hole)
         return holes
 
     def diagnose(
         self, x: int, y: int, depth_mm: np.ndarray, depression: np.ndarray,
-        object_mask: np.ndarray, object_bbox: tuple, lines, radius: int | None = None,
+        object_mask: np.ndarray, object_bbox: tuple, lines, gray_raw: np.ndarray | None = None,
+        radius: int | None = None,
     ) -> dict:
         """[역할] 임의의 픽셀 하나가 왜 홀로 인정되는지/안 되는지 진단 정보를 반환한다
         (model.py 클릭 디버그 도구용). `_verify_candidates`와 완전히 같은 판정
@@ -392,7 +575,11 @@ class HoleDetector:
         if radius is None:
             radius = max(3, int(round((self.config.min_hole_diameter_mm + self.config.max_hole_diameter_mm)
                                        / 4 * self._px_per_mm_from_depth(depth_mm, object_mask))))
-        _hole, diagnostics = self._evaluate_candidate(x, y, radius, depth_mm, depression, object_mask, object_bbox, lines)
+        if gray_raw is None:
+            gray_raw = np.zeros(depth_mm.shape, dtype=np.uint8)
+        _hole, diagnostics = self._evaluate_candidate(
+            x, y, radius, depth_mm, depression, object_mask, object_bbox, lines, gray_raw
+        )
         return diagnostics
 
     def _px_per_mm_from_depth(self, depth_mm: np.ndarray, object_mask: np.ndarray) -> float:
@@ -400,7 +587,7 @@ class HoleDetector:
         median_depth_mm = float(np.median(region)) if region.size else 300.0
         return self.intrinsics.fx / median_depth_mm
 
-    def _evaluate_candidate(self, x, y, radius, depth_mm, depression, object_mask, object_bbox, lines):
+    def _evaluate_candidate(self, x, y, radius, depth_mm, depression, object_mask, object_bbox, lines, gray_raw):
         """[역할] 후보 하나를 검증해 (DetectedHole 또는 None, 진단 dict)를 반환한다.
 
         진단 dict의 "reject_reason"에 어느 단계에서 왜 떨어졌는지 문자열로 남긴다 -
@@ -498,6 +685,18 @@ class HoleDetector:
                 diag["reject_reason"] = f"양의 방향 비율 {positive_fraction:.2f} < 기준 {required_positive_fraction}"
             else:
                 diag["reject_reason"] = f"방향별 변동계수 {uniformity_cv:.2f} > 기준 {max_uniformity_cv:.2f} (모양이 안 둥긂)"
+            return None, diag
+
+        # RGB 그림자/하이라이트 점수 - depth 검증을 통과한 후보에 한해 계산한다
+        # (모든 후보마다 계산하면 낭비이므로). 기본은 진단 정보로만 남기고,
+        # enable_shadow_highlight_check가 켜져 있으면 실제 판정에도 반영한다.
+        shadow_highlight_r2 = self._shadow_highlight_r2(gray_raw, x, y, radius)
+        diag["shadow_highlight_r2"] = shadow_highlight_r2
+        if cfg.enable_shadow_highlight_check and shadow_highlight_r2 < cfg.min_shadow_highlight_r2:
+            diag["reject_reason"] = (
+                f"그림자/하이라이트 패턴 적합도 {shadow_highlight_r2:.2f} < 기준 {cfg.min_shadow_highlight_r2} "
+                "(평면 무늬로 의심)"
+            )
             return None, diag
 
         diag["reject_reason"] = None  # 통과
