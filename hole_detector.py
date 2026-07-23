@@ -118,12 +118,15 @@ class HoleDetectorConfig:
     # LoG(Laplacian of Gaussian): 테두리(엣지)가 아니라 "정해진 크기의 둥근
     # 덩어리 자체"를 직접 찾는다 - depression 신호의 테두리가 흐릿해도 덩어리
     # 존재 자체는 잡아낼 수 있어서 Hough가 놓치는 후보를 보완한다.
-    enable_log_candidates: bool = True
+    # 실측 결과 새로 잡아주는 정탐지보다 새 오탐지가 더 많이 보여서, 검증되기
+    # 전까지는 기본을 꺼둔다 (라인 검출/그림자 점수와 같은 방침).
+    enable_log_candidates: bool = False
 
     # 템플릿 매칭: 이번 프레임에서 이미 검증된 홀 하나를 템플릿으로 잘라, 화면
     # 전체에서 그것과 닮은 자리를 추가로 찾는다. Hough/LoG처럼 모양(엣지/블롭)에
     # 기대는 게 아니라 "이미 확인된 진짜 홀과 얼마나 닮았는가"라는 별개 기준.
-    enable_template_matching: bool = True
+    # LoG와 같은 이유로 기본은 꺼둔다.
+    enable_template_matching: bool = False
     template_match_threshold: float = 0.5  # 정규화 상관계수 최소값
 
     # --- RGB 그림자/하이라이트 비대칭 검사 ---
@@ -527,10 +530,21 @@ class HoleDetector:
             template_candidates = self._template_candidates(
                 gray, holes, default_radius_px, cfg.template_match_threshold, min_distance_px
             )
-            existing = [(h.pixel[0], h.pixel[1], int(h.diameter_px / 2)) for h in holes]
+            # 중복 판단 기준은 "같은 후보 원끼리 겹치는지"(반지름 기준, 위 1차 dedup)가
+            # 아니라 "이미 확정된 홀과 같은 물리적 구멍인지"(실제 홀 간격 기준)라서
+            # min_distance_px를 써야 한다 - 반지름의 0.7배(~11~14px)는 너무 좁아서
+            # 상관관계 곡면이 부드러운 템플릿 매칭에서 같은 홀 주변 몇 픽셀 떨어진
+            # 점도 "새 후보"로 통과해 중복 검출되는 버그가 있었다 (실측으로 확인).
+            existing_xy = [(h.pixel[0], h.pixel[1]) for h in holes]
             new_unique: list[tuple[int, int, int]] = []
             for cx, cy, cr in template_candidates:
-                if all((cx - ux) ** 2 + (cy - uy) ** 2 > (min(cr, ur) * 0.7) ** 2 for ux, uy, ur in existing + new_unique):
+                too_close_to_existing = any(
+                    (cx - ux) ** 2 + (cy - uy) ** 2 < min_distance_px ** 2 for ux, uy in existing_xy
+                )
+                too_close_to_new = any(
+                    (cx - nx) ** 2 + (cy - ny) ** 2 < min_distance_px ** 2 for nx, ny, _ in new_unique
+                )
+                if not too_close_to_existing and not too_close_to_new:
                     new_unique.append((cx, cy, cr))
             if new_unique:
                 extra_holes = self._verify_candidates(new_unique, depth_mm, depression, object_mask, object_bbox, lines, gray_raw)
@@ -700,12 +714,16 @@ class HoleDetector:
             return None, diag
 
         diag["reject_reason"] = None  # 통과
-        floor_depth_mm = ring_depth_mm + (recess_mm if recess_mm is not None else cfg.min_hole_depth_mm)
+        # 표시/반환하는 깊이는 판정에 실제로 쓰인 median_recess를 쓴다 - 중심점만
+        # 보는 raw recess_mm을 썼더니, 통과 판정(중앙값 기준)과 표시값(중심점 기준)이
+        # 서로 달라 "홀로 인정됐는데 깊이가 음수"처럼 모순된 값이 나온 적이 있었다.
+        reported_depth_mm = median_recess if recess_mm is not None else cfg.min_hole_depth_mm
+        floor_depth_mm = ring_depth_mm + reported_depth_mm
         point = rs_deproject(self.intrinsics, x, y, floor_depth_mm / 1000.0)
         hole = DetectedHole(
             pixel=(x, y),
             depth_m=floor_depth_mm / 1000.0,
-            hole_depth_mm=recess_mm if recess_mm is not None else cfg.min_hole_depth_mm,
+            hole_depth_mm=reported_depth_mm,
             diameter_px=2.0 * radius,
             point_camera_m=point,
         )
