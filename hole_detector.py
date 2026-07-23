@@ -520,7 +520,7 @@ class HoleDetector:
             if all((cx - ux) ** 2 + (cy - uy) ** 2 > (min(cr, ur) * 0.7) ** 2 for ux, uy, ur in unique_candidates):
                 unique_candidates.append((cx, cy, cr))
 
-        object_bbox = cv2.boundingRect(object_mask)  # (x, y, w, h) - 완화 기준의 "가장자리"는 이걸 기준으로 삼는다
+        object_bbox = cv2.boundingRect(object_mask)  # (x, y, w, h)
         holes = self._verify_candidates(unique_candidates, depth_mm, depression, object_mask, object_bbox, lines, gray_raw)
 
         # 템플릿 매칭 2차 패스: 1차에서 홀이 하나라도 확정됐으면, 그걸 템플릿으로
@@ -609,7 +609,6 @@ class HoleDetector:
         """
         cfg = self.config
         height, width = depth_mm.shape
-        bx, by, bw, bh = object_bbox
         diag: dict = {"pixel": (x, y), "radius_px": radius}
 
         if not (0 <= x < width and 0 <= y < height) or object_mask[y, x] == 0:
@@ -639,14 +638,9 @@ class HoleDetector:
             diag["reject_reason"] = "깊은 영역이 반경 밖까지 이어짐 (그루브로 판단)"
             return None, diag
 
-        # "가장자리"는 화면(이미지) 기준이 아니라 물체(object_mask) 자체의 경계
-        # 기준으로 판단한다 - 화면 기준으로 하면 물체가 프레임 안 어디에 놓였는지에
-        # 따라 같은 물리적 위치가 다르게 취급돼서(예: 물체가 화면 하단에 걸치면
-        # 그 부분만 부당하게 완화됨), 완화가 물체 위치와 무관하게 일관되지 않았다.
-        edge_ratio = max(abs(x - (bx + bw / 2)) / (bw / 2), abs(y - (by + bh / 2)) / (bh / 2))
-        is_edge = edge_ratio >= 0.75  # 스테레오 매칭이 덜 완전한 물체 실제 테두리 근처만 완화
-        required_ring_valid = 0.55 if is_edge else 0.75
-        diag["is_edge"] = is_edge
+        # 가장자리(물체 테두리 근처) 완화 없이, 어디서든 동일하게 엄격한 기준을
+        # 적용한다 - 완화 구간이 하단 등 특정 위치의 오탐지를 늘리는 원인이었다.
+        required_ring_valid = 0.75
 
         if ring_valid_fraction < required_ring_valid:
             diag["reject_reason"] = f"링 유효 비율 {ring_valid_fraction:.2f} < 기준 {required_ring_valid}"
@@ -658,7 +652,7 @@ class HoleDetector:
         # 1~2방향만 깊고 나머지는 거의 0이라 편차가 크고, 진짜 원형 홀은 신호
         # 세기와 무관하게 사방에서 고르게 깊다.
         valid_sectors = sector_recesses[~np.isnan(sector_recesses)]
-        required_valid_sectors = 4 if is_edge else 6
+        required_valid_sectors = 6
         diag["valid_sector_count"] = int(valid_sectors.size)
         if valid_sectors.size < required_valid_sectors:
             diag["reject_reason"] = f"유효 섹터 {valid_sectors.size}개 < 기준 {required_valid_sectors}"
@@ -674,8 +668,8 @@ class HoleDetector:
         uniformity_cv = mad / (abs(median_recess) + cfg.sector_positive_floor_mm)
         diag.update(median_recess_mm=median_recess, positive_fraction=positive_fraction, uniformity_cv=uniformity_cv)
 
-        required_positive_fraction = 0.5 if is_edge else cfg.min_sector_positive_fraction
-        max_uniformity_cv = cfg.max_sector_variation * (1.3 if is_edge else 1.0)
+        required_positive_fraction = cfg.min_sector_positive_fraction
+        max_uniformity_cv = cfg.max_sector_variation
         diag.update(required_positive_fraction=required_positive_fraction, max_uniformity_cv=max_uniformity_cv)
 
         accepted = (
@@ -687,7 +681,7 @@ class HoleDetector:
         # 아주 좁고 깊은 홀은 중심부 depth 측정 자체가 실패(무효)할 수 있다 -
         # 그 경우 링이 충분히 유효하고 중심 무효 비율이 높으면 홀로 인정.
         if not accepted and recess_mm is None:
-            accepted = invalid_fraction >= 0.65 and ring_valid_fraction >= (0.80 if is_edge else 0.95)
+            accepted = invalid_fraction >= 0.65 and ring_valid_fraction >= 0.95
 
         if not accepted:
             if recess_mm is None:
