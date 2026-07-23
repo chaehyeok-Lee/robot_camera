@@ -134,7 +134,7 @@ class HoleDetectorConfig:
     # 없다). 8방향 평균 밝기에 코사인 하나를 맞춰서 그 적합도(R^2)를 점수로
     # 쓴다. 아직 실측으로 임계값을 검증하지 않아서 기본은 점수만 진단에 남기고
     # 판정에는 반영하지 않는다 - True로 켜면 min_shadow_highlight_r2 미만은 제외.
-    enable_shadow_highlight_check: bool = False
+    enable_shadow_highlight_check: bool = True
     min_shadow_highlight_r2: float = 0.3
 
 
