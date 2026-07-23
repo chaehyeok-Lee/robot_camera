@@ -137,6 +137,16 @@ class HoleDetectorConfig:
     enable_shadow_highlight_check: bool = False
     min_shadow_highlight_r2: float = 0.3
 
+    # --- 스터드(못) 삽입 후 상태 분류 (정확/틀어짐/덜 박힘) ---
+    # 홀 탐지(삽입 전)와는 별개 기능. 삽입 전 탐지된 좌표(x,y,radius)를 그대로
+    # 재사용해 그 자리의 depth 프로파일만 다시 읽어 상태를 판정한다 - 카메라/
+    # 물체가 삽입 도중 움직이지 않는다고 가정.
+    # recess_mm 부호 규약(_circle_depth_evidence와 동일): 양수=주변 표면보다
+    # 더 멀다(안쪽으로 들어가 있음), 음수=주변보다 더 가깝다(튀어나옴).
+    stud_seating_tolerance_mm: float = 1.0  # |recess|가 이 안이면 표면과 거의 같은 높이(정확)로 봄
+    stud_tilt_amplitude_mm: float = 1.2  # 8방향 recess에 맞춘 코사인 진폭이 이보다 커야 "기울어짐" 후보
+    stud_tilt_r2: float = 0.6  # 코사인 적합도(R^2)가 이보다 높아야 노이즈가 아니라 진짜 방향성 기울기
+
 
 @dataclass
 class DetectedHole:
@@ -147,6 +157,17 @@ class DetectedHole:
     hole_depth_mm: float  # 주변 링 대비 홀이 얼마나 깊은지 (mm)
     diameter_px: float
     point_camera_m: np.ndarray = field(repr=False)  # 카메라 좌표계 (x, y, z), 미터
+
+
+@dataclass
+class StudState:
+    """[역할] 이미 삽입된 스터드 하나의 상태 판정 결과 (`classify_stud_state` 반환값)."""
+
+    pixel: tuple
+    status: str  # "correct" | "tilted" | "under_inserted" | "unknown"
+    seating_offset_mm: float | None  # 양수=주변보다 안쪽(들어가있음), 음수=튀어나옴
+    tilt_amplitude_mm: float
+    tilt_r2: float
 
 
 def _valid_median(values: np.ndarray) -> float | None:
@@ -399,6 +420,26 @@ class HoleDetector:
         centre_labels = centre_labels[centre_labels != 0]
         return any(np.any(labels[outside] == label) for label in centre_labels)
 
+    @staticmethod
+    def _fit_directional_cosine(values: np.ndarray, angles: np.ndarray) -> tuple[float, float, float]:
+        """[역할] 방향(각도)별 값에 코사인 하나(offset + amplitude*cos(angle-phase))를
+        최소자승으로 맞춘다. 값이 6개 미만이면 (0,0,0). 반환: (amplitude, r2, phase).
+
+        `_shadow_highlight_r2`(RGB 밝기)와 `classify_stud_state`(depth recess)가
+        동일한 적합 로직을 쓰므로 공유 헬퍼로 뺐다.
+        """
+        if values.size < 6:
+            return 0.0, 0.0, 0.0
+        design = np.column_stack([np.ones_like(angles), np.cos(angles), np.sin(angles)])
+        coeffs, *_ = np.linalg.lstsq(design, values, rcond=None)
+        predicted = design @ coeffs
+        residual_ss = float(np.sum((values - predicted) ** 2))
+        total_ss = float(np.sum((values - np.mean(values)) ** 2))
+        r2 = 0.0 if total_ss < 1e-6 else max(0.0, 1.0 - residual_ss / total_ss)
+        amplitude = float(np.hypot(coeffs[1], coeffs[2]))
+        phase = float(np.arctan2(coeffs[2], coeffs[1]))
+        return amplitude, r2, phase
+
     def _shadow_highlight_r2(self, gray_raw: np.ndarray, x: int, y: int, radius: int) -> float:
         """[역할] 조명이 한 방향에서 올 때 진짜 오목한 홀에 생기는 "한쪽은 그늘,
         반대쪽은 밝음"이라는 매끈한 방향성 패턴을 점수화한다.
@@ -433,19 +474,8 @@ class HoleDetector:
             if values.size:
                 means.append(float(np.mean(values)))
                 angles.append(lower + np.pi / 8)
-        if len(means) < 6:
-            return 0.0
-
-        means_arr = np.array(means)
-        angles_arr = np.array(angles)
-        design = np.column_stack([np.ones_like(angles_arr), np.cos(angles_arr), np.sin(angles_arr)])
-        coeffs, *_ = np.linalg.lstsq(design, means_arr, rcond=None)
-        predicted = design @ coeffs
-        residual_ss = float(np.sum((means_arr - predicted) ** 2))
-        total_ss = float(np.sum((means_arr - np.mean(means_arr)) ** 2))
-        if total_ss < 1e-6:
-            return 0.0
-        return max(0.0, 1.0 - residual_ss / total_ss)
+        _amplitude, r2, _phase = self._fit_directional_cosine(np.array(means), np.array(angles))
+        return r2
 
     def _detect_lines(self, gray: np.ndarray, px_per_mm: float) -> np.ndarray | None:
         """[역할] RGB(CLAHE 보정 흑백)에서 직선(트레드 문양 선) 구간을 찾는다.
@@ -599,6 +629,87 @@ class HoleDetector:
         region = depth_mm[object_mask > 0]
         median_depth_mm = float(np.median(region)) if region.size else 300.0
         return self.intrinsics.fx / median_depth_mm
+
+    def _face_sector_depths(
+        self, depth_mm: np.ndarray, object_mask: np.ndarray, x: int, y: int, radius: int
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """[역할] 스터드 머리 표면 자체를 8방향으로 나눠 각 방향의 depth 중앙값을 반환.
+
+        `_circle_depth_evidence`의 sector_recesses는 "주변 링이 방향별로 얼마나
+        고르게 깊은가"(그루브 판별용)라서, 스터드 머리 표면 안쪽의 기울기는
+        전혀 못 잡는다(내부는 중심 하나의 중앙값으로만 뭉뚱그려짐). 기울어짐은
+        머리 표면 자체 안에서 한쪽은 더 들어가고 반대쪽은 덜 들어간 경사이므로,
+        여기서는 반대로 머리 표면(중심 근처는 제외 - 굴곡/노이즈가 큼) 안쪽을
+        8방향으로 나눠 절대 depth 값 자체의 방향성을 본다.
+        """
+        height, width = depth_mm.shape
+        face_outer = max(2, int(round(radius * 0.85)))
+        face_inner = max(1, int(round(radius * 0.25)))
+        left, right = max(0, x - face_outer), min(width, x + face_outer + 1)
+        top, bottom = max(0, y - face_outer), min(height, y + face_outer + 1)
+        if right - left < 3 or bottom - top < 3:
+            return None
+
+        yy, xx = np.ogrid[top:bottom, left:right]
+        distance2 = (xx - x) ** 2 + (yy - y) ** 2
+        face = (distance2 >= face_inner ** 2) & (distance2 <= face_outer ** 2)
+        face = face & (object_mask[top:bottom, left:right] > 0)
+        crop = depth_mm[top:bottom, left:right]
+        angle = np.arctan2(yy - y, xx - x)
+
+        depths, angles = [], []
+        for sector in range(8):
+            lower = -np.pi + sector * (np.pi / 4)
+            upper = lower + np.pi / 4
+            sector_depth = _valid_median(crop[face & (angle >= lower) & (angle < upper)])
+            if sector_depth is not None:
+                depths.append(sector_depth)
+                angles.append(lower + np.pi / 8)
+        if len(depths) < 6:
+            return None
+        return np.array(depths), np.array(angles)
+
+    def classify_stud_state(
+        self, depth_mm: np.ndarray, object_mask: np.ndarray, x: int, y: int, radius: int
+    ) -> StudState:
+        """[역할] 이미 스터드가 박힌 자리(삽입 전 홀 탐지로 얻은 x,y,radius를 그대로
+        재사용한다고 가정 - 카메라/물체가 삽입 도중 움직이지 않아야 함)에서, 그
+        상태를 "correct"(정확히 박힘) / "tilted"(틀어짐) / "under_inserted"(덜 박힘)
+        중 하나로 판정한다. 홀 탐지와 판정 기준이 다르므로 accept/reject가 아니라
+        독립적인 분류 함수다.
+
+        - 전체적으로 얼마나 안쪽/바깥쪽에 있는지(seating_offset_mm)는
+          `_circle_depth_evidence`의 recess_mm(머리 중심 vs 주변 표면 링)을
+          그대로 재사용한다 - 양수=주변보다 안쪽/멀다, 음수=튀어나옴/가깝다.
+        - 기울어짐은 `_face_sector_depths`로 머리 표면 자체의 방향별 depth를
+          구해 코사인 하나를 맞춘 뒤(`_fit_directional_cosine`) 진폭과 적합도
+          (R^2)를 본다 - 진짜 기울기는 둘 다 기준 이상, 노이즈는 진폭이 있어도
+          R^2가 낮게 나온다.
+        - 기울지 않았다면 전체 recess_mm으로 튀어나왔는지(허용 오차보다 더
+          음수)만 보고 덜 박힘/정확 중 하나로 정리한다.
+        """
+        cfg = self.config
+        evidence = self._circle_depth_evidence(depth_mm, object_mask, x, y, radius)
+        if evidence is None:
+            return StudState((x, y), "unknown", None, 0.0, 0.0)
+        recess_mm, _invalid_fraction, ring_valid_fraction, _sector_recesses, _ring_depth_mm = evidence
+        if recess_mm is None or ring_valid_fraction < 0.75:
+            return StudState((x, y), "unknown", recess_mm, 0.0, 0.0)
+
+        face_data = self._face_sector_depths(depth_mm, object_mask, x, y, radius)
+        if face_data is None:
+            return StudState((x, y), "unknown", recess_mm, 0.0, 0.0)
+        face_depths, face_angles = face_data
+        amplitude, r2, _phase = self._fit_directional_cosine(face_depths, face_angles)
+
+        if amplitude >= cfg.stud_tilt_amplitude_mm and r2 >= cfg.stud_tilt_r2:
+            status = "tilted"
+        elif recess_mm < -cfg.stud_seating_tolerance_mm:
+            status = "under_inserted"
+        else:
+            status = "correct"
+
+        return StudState((x, y), status, recess_mm, amplitude, r2)
 
     def _evaluate_candidate(self, x, y, radius, depth_mm, depression, object_mask, object_bbox, lines, gray_raw):
         """[역할] 후보 하나를 검증해 (DetectedHole 또는 None, 진단 dict)를 반환한다.
