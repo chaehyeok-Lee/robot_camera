@@ -118,15 +118,14 @@ class HoleDetectorConfig:
     # LoG(Laplacian of Gaussian): 테두리(엣지)가 아니라 "정해진 크기의 둥근
     # 덩어리 자체"를 직접 찾는다 - depression 신호의 테두리가 흐릿해도 덩어리
     # 존재 자체는 잡아낼 수 있어서 Hough가 놓치는 후보를 보완한다.
-    # 실측 결과 새로 잡아주는 정탐지보다 새 오탐지가 더 많이 보여서, 검증되기
-    # 전까지는 기본을 꺼둔다 (라인 검출/그림자 점수와 같은 방침).
-    enable_log_candidates: bool = False
+    # (이전에 중복 검출/표시값 불일치 버그가 있어 꺼뒀었는데, 두 버그를 고쳤으니
+    # Hough 단독 대비 재현율을 더 올릴 수 있는지 다시 켜서 비교해본다.)
+    enable_log_candidates: bool = True
 
     # 템플릿 매칭: 이번 프레임에서 이미 검증된 홀 하나를 템플릿으로 잘라, 화면
     # 전체에서 그것과 닮은 자리를 추가로 찾는다. Hough/LoG처럼 모양(엣지/블롭)에
     # 기대는 게 아니라 "이미 확인된 진짜 홀과 얼마나 닮았는가"라는 별개 기준.
-    # LoG와 같은 이유로 기본은 꺼둔다.
-    enable_template_matching: bool = False
+    enable_template_matching: bool = True
     template_match_threshold: float = 0.5  # 정규화 상관계수 최소값
 
     # --- RGB 그림자/하이라이트 비대칭 검사 ---
