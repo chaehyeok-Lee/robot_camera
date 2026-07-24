@@ -120,7 +120,7 @@ def main() -> None:
     # on/off 토글이 아니라 "지금 시점의 홀 탐지 결과로 검사 좌표를 (다시) 고정"
     # 하는 동작으로 바뀌었다.
     click_state = {"depth_m": None, "debug": None, "last_click_raw": None, "last_click": None, "stud_mode": True}
-    STUD_STATUS_LABEL = {"correct": "정확", "tilted": "틀어짐", "under_inserted": "덜박힘", "unknown": "불명"}
+    STUD_STATUS_LABEL = {"correct": "정상", "tilted": "틀어짐", "under_inserted": "덜박힘", "unknown": "원인불명"}
 
     def on_mouse(event, x, y, flags, param):
         if event != cv2.EVENT_LBUTTONDOWN or param["depth_m"] is None:
@@ -216,15 +216,11 @@ def main() -> None:
         fused_color = np.median(np.stack(color_stack, axis=0), axis=0).astype(np.uint8)
         return fused_depth, fused_color
 
-    # 상태별 표시 색(BGR) - 초록=정확, 노랑=틀어짐, 빨강=덜 박힘, 회색=판정 불가
-    STUD_STATE_COLOR = {
-        "correct": (0, 200, 0),
-        "tilted": (0, 220, 220),
-        "under_inserted": (0, 0, 255),
-        "unknown": (150, 150, 150),
-    }
+    # 이미 스터드가 박힌 자리는 아직 안 뚫린 홀(빨간 원)과 구분되게 항상 주황색 원으로
+    # 표시하고, 상태(정상/틀어짐/덜박힘/원인불명)는 라벨 텍스트로만 구분한다.
+    STUD_CIRCLE_COLOR = (0, 165, 255)  # 주황
     STUD_STATE_LABEL = {
-        "correct": "정확", "tilted": "틀어짐", "under_inserted": "덜박힘", "unknown": "불명",
+        "correct": "정상", "tilted": "틀어짐", "under_inserted": "덜박힘", "unknown": "원인불명",
     }
 
     def render(
@@ -234,21 +230,21 @@ def main() -> None:
         """[역할] 한 프레임(실시간 또는 평균 캡처 결과)을 오버레이 그려서 창에 표시."""
         display = color_image.copy()
         if stud_states is not None:
-            # 스터드 검사 모드: 삽입 전 좌표를 고정해두고 상태만 색으로 표시
+            # 이미 박힌 자리는 색으로 상태를 구분하지 않고 전부 주황 원으로 그린다 -
+            # 빨간 원(아직 안 뚫린 홀)과 한눈에 구분되게, 상태는 라벨 텍스트로만 표시.
             for state in stud_states:
                 u, v = state.pixel
-                color = STUD_STATE_COLOR[state.status]
-                cv2.circle(display, (u, v), 12, color, 2)
+                cv2.circle(display, (u, v), 12, STUD_CIRCLE_COLOR, 2)
                 offset_text = "-" if state.seating_offset_mm is None else f"{state.seating_offset_mm:.1f}mm"
                 cv2.putText(
                     display, f"{STUD_STATE_LABEL[state.status]} {offset_text}", (u + 6, v - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, STUD_CIRCLE_COLOR, 1,
                 )
             counts = {status: sum(1 for s in stud_states if s.status == status) for status in STUD_STATE_LABEL}
             cv2.putText(
                 display,
-                f"stud check: 정확 {counts['correct']} / 틀어짐 {counts['tilted']} / "
-                f"덜박힘 {counts['under_inserted']} / 불명 {counts['unknown']}",
+                f"stud check: 정상 {counts['correct']} / 틀어짐 {counts['tilted']} / "
+                f"덜박힘 {counts['under_inserted']} / 원인불명 {counts['unknown']}",
                 (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
             )
         else:
