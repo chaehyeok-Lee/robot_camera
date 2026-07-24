@@ -140,8 +140,13 @@ class HoleDetectorConfig:
     # --- 스터드(못) 삽입 후 상태 분류 (정상/틀어짐/덜 박힘) ---
     # 홀 탐지(삽입 전)와는 별개 기능. recess_mm 부호 규약(_circle_depth_evidence와
     # 동일): 양수=주변 표면보다 더 멀다(안쪽으로 들어가 있음), 음수=주변보다 더
-    # 가깝다(튀어나옴).
+    # 가깝다(튀어나옴). "정상(=표면과 거의 같은 높이, flush)"은 recess가 0 근처일
+    # 때만이고, 양수/음수 어느 쪽으로든 벗어나면 "덜 박힘"이다 - 아직 설계 깊이
+    # (3mm)만큼 다 안 들어가서 오목한 굴곡이 남아있어도(recess 양수), 반대로
+    # 표면 밖으로 튀어나와도(recess 음수) 둘 다 "제대로 안 박힘"이라는 뜻이라서.
     stud_seating_tolerance_mm: float = 1.0  # |recess|가 이 안이면 표면과 거의 같은 높이(정상)로 봄
+    stud_partial_max_depth_mm: float = 3.0  # 설계상 홀 깊이 상한 - 이보다 더 깊게 파인 걸로 나오면
+    # (예: 빈 홀을 스터드로 착각) 신뢰할 수 없다고 보고 "원인불명" 처리
     stud_tilt_amplitude_mm: float = 1.2  # 8방향 recess에 맞춘 코사인 진폭이 이보다 커야 "기울어짐" 후보
     stud_tilt_r2: float = 0.6  # 코사인 적합도(R^2)가 이보다 높아야 노이즈가 아니라 진짜 방향성 기울기
 
@@ -690,13 +695,16 @@ class HoleDetector:
 
         - 전체적으로 얼마나 안쪽/바깥쪽에 있는지(seating_offset_mm)는
           `_circle_depth_evidence`의 recess_mm(머리 중심 vs 주변 표면 링)을
-          그대로 재사용한다 - 양수=주변보다 안쪽/멀다, 음수=튀어나옴/가깝다.
+          그대로 재사용한다 - 양수=주변보다 안쪽/멀다(아직 설계 깊이만큼 다 안
+          들어가 오목한 굴곡이 남음), 음수=튀어나옴/가깝다(표면 밖으로 나옴).
+          "정상(flush)"은 이 값이 0 근처(허용 오차 이내)일 때뿐이고, 양쪽 어느
+          방향으로 벗어나도 "덜 박힘"이다. recess가 설계 홀 깊이 상한
+          (`stud_partial_max_depth_mm`)보다도 크면 신뢰할 수 없는 값(예: 빈
+          홀을 스터드로 착각)으로 보고 "원인불명" 처리한다.
         - 기울어짐은 `_face_sector_depths`로 머리 표면 자체의 방향별 depth를
           구해 코사인 하나를 맞춘 뒤(`_fit_directional_cosine`) 진폭과 적합도
           (R^2)를 본다 - 진짜 기울기는 둘 다 기준 이상, 노이즈는 진폭이 있어도
           R^2가 낮게 나온다.
-        - 기울지 않았다면 전체 recess_mm으로 튀어나왔는지(허용 오차보다 더
-          음수)만 보고 덜 박힘/정확 중 하나로 정리한다.
         """
         cfg = self.config
         evidence = self._circle_depth_evidence(depth_mm, object_mask, x, y, radius)
@@ -704,6 +712,8 @@ class HoleDetector:
             return StudState((x, y), "unknown", None, 0.0, 0.0)
         recess_mm, _invalid_fraction, ring_valid_fraction, _sector_recesses, _ring_depth_mm = evidence
         if recess_mm is None or ring_valid_fraction < 0.75:
+            return StudState((x, y), "unknown", recess_mm, 0.0, 0.0)
+        if recess_mm > cfg.stud_partial_max_depth_mm:
             return StudState((x, y), "unknown", recess_mm, 0.0, 0.0)
 
         face_data = self._face_sector_depths(depth_mm, object_mask, x, y, radius)
@@ -714,38 +724,47 @@ class HoleDetector:
 
         if amplitude >= cfg.stud_tilt_amplitude_mm and r2 >= cfg.stud_tilt_r2:
             status = "tilted"
-        elif recess_mm < -cfg.stud_seating_tolerance_mm:
+        elif abs(recess_mm) > cfg.stud_seating_tolerance_mm:
             status = "under_inserted"
         else:
             status = "correct"
 
         return StudState((x, y), status, recess_mm, amplitude, r2)
 
-    def _detect_stud_head_candidates(
-        self, color_bgr: np.ndarray, object_mask: np.ndarray, px_per_mm: float
-    ) -> list[tuple[int, int, int]]:
-        """[역할] 검은 타이어 위 은색 스터드 머리를 RGB 밝기/무채색 여부로 찾는다.
+    def _silver_mask(self, color_bgr: np.ndarray, object_mask: np.ndarray) -> np.ndarray:
+        """[역할] 검은 타이어 위에서 은색(금속) 픽셀만 True인 불리언 마스크.
 
         무광 검은 PLA는 거의 항상 어둡고, 금속 스터드 머리는 밝고 무채색(R≈G≈B)
-        이라 대비가 뚜렷하다 - depth 굴곡(빈 홀 탐지용)과 달리 이전 프레임 좌표를
-        기억할 필요가 없다.
-
-        "무채색"은 HSV 채도가 아니라 R/G/B 채널 간 최대-최소 편차(chroma)로
-        직접 판단한다 - 카드보드 박스/나무 바닥처럼 밝지만 갈색/베이지 색조가
-        있는 배경이 HSV 채도만으로는 걸러지지 않고 후보로 잡히는 게 실측으로
-        확인됐다(물체와 비슷한 거리에 배경이 살짝 걸쳐 object_mask 안에 들어온
-        경우). 진짜 은색 금속은 R/G/B가 서로 거의 같아서 chroma가 훨씬 작다.
+        이라 대비가 뚜렷하다. "무채색"은 HSV 채도가 아니라 R/G/B 채널 간
+        최대-최소 편차(chroma)로 직접 판단한다 - 카드보드 박스/나무 바닥처럼
+        밝지만 갈색/베이지 색조가 있는 배경이 HSV 채도만으로는 걸러지지 않고
+        후보로 잡히는 게 실측으로 확인됐다(물체와 비슷한 거리에 배경이 살짝
+        걸쳐 object_mask 안에 들어온 경우). 진짜 은색 금속은 R/G/B가 서로
+        거의 같아서 chroma가 훨씬 작다.
         """
         cfg = self.config
         color_i16 = color_bgr.astype(np.int16)
         channel_max = color_i16.max(axis=2)
         chroma = channel_max - color_i16.min(axis=2)
-        bright = (
+        return (
             (channel_max >= cfg.stud_head_min_brightness)
             & (chroma <= cfg.stud_head_max_chroma)
             & (object_mask > 0)
         )
-        mask = bright.astype(np.uint8) * 255
+
+    def _detect_stud_head_candidates(
+        self, color_bgr: np.ndarray, object_mask: np.ndarray, px_per_mm: float
+    ) -> list[tuple[int, int, int]]:
+        """[역할] 은색 픽셀이 뭉친 덩어리를 찾아 (x,y,radius) 후보로 반환한다.
+
+        완전히 박혀 표면과 거의 같은 높이(flush)라 depth 굴곡이 거의 없는
+        스터드도 이걸로 잡힌다 - depth 굴곡(빈 홀 탐지용)과 달리 이전 프레임
+        좌표를 기억할 필요가 없다. (아직 설계 깊이만큼 안 들어가 굴곡이 남아
+        있는 "덜 박힘" 케이스는 `detect_stud_states`가 별도 경로로 찾는다 -
+        가려진 부분이 많아 여기 면적/밝기 기준을 못 넘기는 경우가 있어서.)
+        """
+        cfg = self.config
+        mask = self._silver_mask(color_bgr, object_mask).astype(np.uint8) * 255
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
 
@@ -767,17 +786,45 @@ class HoleDetector:
         return candidates
 
     def detect_stud_states(self, color_bgr: np.ndarray, depth_m: np.ndarray) -> tuple[list[StudState], dict]:
-        """[역할] 이미 삽입된 스터드를 RGB로 직접 찾아 각각의 상태를 판정한다
-        (holes와 대응되는 메인 진입점). 삽입 전 좌표를 저장해둘 필요가 없다 -
-        매 프레임 그 자리에서 새로 찾기 때문에 카메라/물체가 움직여도 안전하다.
+        """[역할] 이미 삽입된 스터드를 찾아 각각의 상태를 판정한다 (holes와
+        대응되는 메인 진입점). 삽입 전 좌표를 저장해둘 필요가 없다 - 매 프레임
+        그 자리에서 새로 찾기 때문에 카메라/물체가 움직여도 안전하다.
+
+        두 경로로 후보 위치를 찾아 합친다:
+        1. RGB 은색 블롭(`_detect_stud_head_candidates`) - 완전히 박혀 표면과
+           거의 같은 높이(flush)라 depth 굴곡이 거의 없는 스터드를 잡는다.
+        2. 빈 홀과 같은 depth 굴곡 후보(Hough) 중, 그 안에 은색 픽셀이 하나라도
+           있는 것만 - 아직 설계 깊이만큼 안 들어가 굴곡이 남아있으면서(그래서
+           빈 홀 탐지 방식으로는 잡히지만) 안쪽 그늘 때문에 보이는 금속 면적이
+           작아 경로 1의 면적/밝기 기준을 못 넘기는 "덜 박힘" 케이스를 잡는다.
+           은색이 전혀 없으면 그냥 진짜 빈 홀이므로 후보에서 뺀다.
         """
+        cfg = self.config
         object_mask = self.segment_object(depth_m)
         if cv2.countNonZero(object_mask) == 0:
             return [], {"object_mask": object_mask}
 
         px_per_mm = self._px_per_mm(depth_m, object_mask)
         depth_mm = depth_m * 1000.0
-        candidates = self._detect_stud_head_candidates(color_bgr, object_mask, px_per_mm)
+        min_radius_px = max(2, int(round(cfg.min_hole_diameter_mm / 2 * px_per_mm)))
+        max_radius_px = max(min_radius_px + 1, int(round(cfg.max_hole_diameter_mm / 2 * px_per_mm)))
+        min_distance_px = max(4.0, cfg.min_candidate_distance_mm * px_per_mm)
+
+        candidates = list(self._detect_stud_head_candidates(color_bgr, object_mask, px_per_mm))
+
+        sigma_px = cfg.surface_blur_sigma_px or (max_radius_px * 2.5)
+        depression = self._make_depression_image(depth_mm, object_mask, sigma_px)
+        depth_candidates = self._hough_candidates(depression, min_distance_px, min_radius_px, max_radius_px)
+        silver_mask = self._silver_mask(color_bgr, object_mask)
+        height, width = silver_mask.shape
+        for x, y, r in depth_candidates:
+            top, bottom = max(0, y - r), min(height, y + r + 1)
+            left, right = max(0, x - r), min(width, x + r + 1)
+            if not np.any(silver_mask[top:bottom, left:right]):
+                continue  # 은색이 전혀 없음 - 진짜 빈 홀, 스터드 후보 아님
+            if all((x - ux) ** 2 + (y - uy) ** 2 >= min_distance_px ** 2 for ux, uy, _ur in candidates):
+                candidates.append((x, y, r))
+
         states = [self.classify_stud_state(depth_mm, object_mask, x, y, r) for x, y, r in candidates]
         return states, {"object_mask": object_mask}
 
