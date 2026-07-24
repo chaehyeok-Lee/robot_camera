@@ -18,13 +18,12 @@ JSON 파일로 저장.
         캡처 중엔 물체/카메라를 움직이지 말 것. 결과 화면은 고정되며, 아무 키나
         누르면 실시간 미리보기로 돌아감 (c/s/q는 각자 원래 동작 유지)
     r - 실시간 화면의 안정화 트래커 초기화 (홀이 잘못 고정돼 안 없어질 때)
-    i - 스터드(못) 삽입 후 검사용 좌표를 지금 시점의 홀 탐지 결과로 (다시) 고정.
-        미리보기 클릭 시 진단은 항상 스터드 상태(정확/틀어짐/덜 박힘) 기준으로
-        나온다("i를 계속 누른 상태"와 동일 - 매번 다시 누를 필요 없음). i를 눌러
-        좌표를 고정해두면(카메라/물체가 그 뒤로 움직이지 않는다고 가정) 화면에도
-        그 자리들이 색으로 표시된다(초록=정확, 노랑=틀어짐, 빨강=덜 박힘, 회색=
-        판정 불가). 로봇이 스터드를 박기 직전까지는 기존 홀 탐지로 좌표를 확보해두고,
-        삽입 후 i를 눌러 그 좌표들을 고정한다.
+
+아직 안 뚫린 홀(빨간 원)과 이미 스터드가 박힌 자리(주황 원, 정상/틀어짐/덜 박힘)를
+매 프레임 동시에 찾아 같이 표시한다. 스터드 위치는 depth 굴곡이 아니라 RGB 밝기로
+찾는다(검은 타이어 위 은색 스터드 머리) - 그래서 삽입 전 좌표를 따로 기억해둘 필요가
+없고 카메라/물체가 움직여도 안전하다. 미리보기 클릭 시 진단은 항상 스터드 상태
+(정상/틀어짐/덜 박힘) 기준으로 나온다.
 
 실시간 화면의 빨간 원은 매 프레임 새로 계산한 게 아니라 두 겹으로 안정화된다:
 1) 최근 15프레임을 모아 픽셀별 중앙값으로 depth 노이즈를 줄인 뒤 그 결과로 탐지
@@ -224,38 +223,39 @@ def main() -> None:
     }
 
     def render(
-        depth_m: np.ndarray, color_image: np.ndarray, holes: list, debug: dict, frozen: bool,
-        stud_states: list | None = None,
+        depth_m: np.ndarray, color_image: np.ndarray, holes: list, stud_states: list, debug: dict, frozen: bool,
     ) -> None:
-        """[역할] 한 프레임(실시간 또는 평균 캡처 결과)을 오버레이 그려서 창에 표시."""
+        """[역할] 한 프레임(실시간 또는 평균 캡처 결과)을 오버레이 그려서 창에 표시.
+
+        아직 안 뚫린 홀(빨간 원)과 이미 스터드가 박힌 자리(주황 원)를 동시에 그린다 -
+        RGB로 스터드 위치를 직접 찾으므로(`detect_stud_states`) 매 프레임 둘 다 새로
+        계산된다.
+        """
         display = color_image.copy()
-        if stud_states is not None:
-            # 이미 박힌 자리는 색으로 상태를 구분하지 않고 전부 주황 원으로 그린다 -
-            # 빨간 원(아직 안 뚫린 홀)과 한눈에 구분되게, 상태는 라벨 텍스트로만 표시.
-            for state in stud_states:
-                u, v = state.pixel
-                cv2.circle(display, (u, v), 12, STUD_CIRCLE_COLOR, 2)
-                offset_text = "-" if state.seating_offset_mm is None else f"{state.seating_offset_mm:.1f}mm"
-                cv2.putText(
-                    display, f"{STUD_STATE_LABEL[state.status]} {offset_text}", (u + 6, v - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, STUD_CIRCLE_COLOR, 1,
-                )
-            counts = {status: sum(1 for s in stud_states if s.status == status) for status in STUD_STATE_LABEL}
+        for i, hole in enumerate(holes):
+            u, v = hole.pixel
+            cv2.circle(display, (u, v), max(3, int(hole.diameter_px / 2)), (0, 0, 255), 2)
             cv2.putText(
-                display,
-                f"stud check: 정상 {counts['correct']} / 틀어짐 {counts['tilted']} / "
-                f"덜박힘 {counts['under_inserted']} / 원인불명 {counts['unknown']}",
-                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
+                display, f"#{i} d={hole.hole_depth_mm:.1f}mm", (u + 6, v - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1,
             )
-        else:
-            for i, hole in enumerate(holes):
-                u, v = hole.pixel
-                cv2.circle(display, (u, v), max(3, int(hole.diameter_px / 2)), (0, 0, 255), 2)
-                cv2.putText(
-                    display, f"#{i} d={hole.hole_depth_mm:.1f}mm", (u + 6, v - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1,
-                )
-            cv2.putText(display, f"holes: {len(holes)}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        # 이미 박힌 자리는 색으로 상태를 구분하지 않고 전부 주황 원으로 그린다 -
+        # 빨간 원(아직 안 뚫린 홀)과 한눈에 구분되게, 상태는 라벨 텍스트로만 표시.
+        for state in stud_states:
+            u, v = state.pixel
+            cv2.circle(display, (u, v), 12, STUD_CIRCLE_COLOR, 2)
+            offset_text = "-" if state.seating_offset_mm is None else f"{state.seating_offset_mm:.1f}mm"
+            cv2.putText(
+                display, f"{STUD_STATE_LABEL[state.status]} {offset_text}", (u + 6, v - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, STUD_CIRCLE_COLOR, 1,
+            )
+        counts = {status: sum(1 for s in stud_states if s.status == status) for status in STUD_STATE_LABEL}
+        cv2.putText(
+            display,
+            f"holes: {len(holes)}  |  studs 정상 {counts['correct']} / 틀어짐 {counts['tilted']} / "
+            f"덜박힘 {counts['under_inserted']} / 원인불명 {counts['unknown']}",
+            (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
+        )
         if frozen:
             cv2.putText(display, "AVERAGED (30f) - press any key for live, c to recapture",
                         (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2)
@@ -276,17 +276,12 @@ def main() -> None:
 
     print(
         "D435 hole inspection running. 'q' to quit, 's' to save, 'c' to capture "
-        "a 30-frame averaged (denoised) detection, 'r' to reset the live tracker, "
-        "'i' to (re)pin post-insertion stud-check coordinates - click diagnosis is "
-        "always stud-state based, click preview to read depth."
+        "a 30-frame averaged (denoised) detection, 'r' to reset the live tracker. "
+        "Open holes (red) and already-inserted studs (orange) are both detected "
+        "every frame; click preview to read depth / stud diagnosis."
     )
     last_holes: list = []
     last_color: np.ndarray | None = None
-    # i를 누른 순간의 홀 좌표(x, y, radius_px)를 고정해서 재사용한다 - 삽입된 스터드는
-    # 더 이상 "홀"처럼 안 보여서 실시간 홀 탐지로는 다시 못 찾기 때문에, 삽입 전 마지막으로
-    # 확인된 좌표에서 그대로 depth 상태만 재판정한다. 클릭 진단은 항상 스터드 상태 기준으로
-    # 나오므로(click_state["stud_mode"]=True 고정) 이 목록은 화면 오버레이용으로만 쓰인다.
-    stud_targets: list[tuple[int, int, int]] = []
     try:
         # --- 2. 메인 루프: 프레임마다 캡처 -> 정렬 -> 탐지 -> 시각화 ---
         while True:
@@ -327,25 +322,18 @@ def main() -> None:
             click_state["depth_m"] = depth_m  # on_mouse가 최신(융합된) 프레임을 읽도록 갱신
 
             # 핵심 탐지 호출 (hole_detector.py) - RGB(Hough용) + depth 둘 다 전달.
-            # 스터드 검사 좌표가 고정돼 있어도 계속 호출한다 - 실제로 쓰는 건 홀 목록
-            # 뿐 아니라 debug["depth_mm"]/["object_mask"](고정 좌표 재판정용)도 매
-            # 프레임 새로 필요해서다. 홀 목록 자체도 계속 갱신해둬야 'i'를 다시 눌렀을
-            # 때 최신 좌표로 다시 고정할 수 있다.
             raw_holes, debug = detector.detect(fused_color, depth_m)
             # 매 프레임 결과를 바로 쓰지 않고 트래커에 통과시켜 깜빡임을 없앤다 -
             # 여러 프레임 연속으로 잡힌 것만 화면에 남고, 잠깐 놓쳐도 유지된다.
             holes = tracker.update(raw_holes)
-            last_holes = holes  # 's' 키로 저장 + 'i' 스냅샷용으로 항상 최신 유지
+            last_holes = holes  # 's' 키로 저장할 때 쓰기 위해 보관
             click_state["debug"] = debug  # on_mouse가 object_mask/depression도 읽도록 갱신
 
-            stud_states = None
-            if stud_targets:
-                stud_states = [
-                    detector.classify_stud_state(debug["depth_mm"], debug["object_mask"], x, y, r)
-                    for x, y, r in stud_targets
-                ]
+            # 이미 박힌 스터드는 RGB(검은 타이어 위 은색 머리)로 매 프레임 직접 찾는다 -
+            # 좌표를 기억해둘 필요가 없어서 카메라/물체가 움직여도 안전하다.
+            stud_states, _stud_debug = detector.detect_stud_states(fused_color, depth_m)
 
-            render(depth_m, fused_color, holes, debug, frozen=False, stud_states=stud_states)
+            render(depth_m, fused_color, holes, stud_states, debug, frozen=False)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
@@ -357,14 +345,6 @@ def main() -> None:
                 depth_history.clear()
                 color_history.clear()
                 print("트래커 + 롤링 버퍼 초기화 - 안정화된 홀 목록을 비웠습니다.")
-            if key == ord("i"):
-                if not last_holes:
-                    print("스터드 검사 좌표 고정: 먼저 홀이 하나 이상 탐지된 상태에서 눌러야 합니다.")
-                else:
-                    stud_targets = [
-                        (h.pixel[0], h.pixel[1], max(3, int(h.diameter_px / 2))) for h in last_holes
-                    ]
-                    print(f"스터드 검사 좌표 고정 - {len(stud_targets)}개 (다시 i를 누르면 최신 좌표로 갱신).")
             if key == ord("c"):
                 # --- 다중 프레임 평균 캡처: 물체를 고정한 채 노이즈를 줄여 재탐지 ---
                 while True:
@@ -375,13 +355,17 @@ def main() -> None:
                         break
                     avg_depth_m, avg_color = captured
                     avg_holes, avg_debug = detector.detect(avg_color, avg_depth_m)
+                    avg_stud_states, _avg_stud_debug = detector.detect_stud_states(avg_color, avg_depth_m)
                     last_holes = avg_holes
                     last_color = avg_color
                     click_state["depth_m"] = avg_depth_m
                     click_state["debug"] = avg_debug
-                    print(f"평균 캡처 완료 - 홀 {len(avg_holes)}개 탐지됨 (s로 저장, c로 재촬영, 다른 키는 실시간 복귀)")
+                    print(
+                        f"평균 캡처 완료 - 홀 {len(avg_holes)}개, 스터드 {len(avg_stud_states)}개 탐지됨 "
+                        "(s로 저장, c로 재촬영, 다른 키는 실시간 복귀)"
+                    )
 
-                    render(avg_depth_m, last_color, avg_holes, avg_debug, frozen=True)
+                    render(avg_depth_m, last_color, avg_holes, avg_stud_states, avg_debug, frozen=True)
                     review_key = cv2.waitKey(0) & 0xFF
                     if review_key == ord("q"):
                         return

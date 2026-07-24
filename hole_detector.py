@@ -137,15 +137,21 @@ class HoleDetectorConfig:
     enable_shadow_highlight_check: bool = False
     min_shadow_highlight_r2: float = 0.3
 
-    # --- 스터드(못) 삽입 후 상태 분류 (정확/틀어짐/덜 박힘) ---
-    # 홀 탐지(삽입 전)와는 별개 기능. 삽입 전 탐지된 좌표(x,y,radius)를 그대로
-    # 재사용해 그 자리의 depth 프로파일만 다시 읽어 상태를 판정한다 - 카메라/
-    # 물체가 삽입 도중 움직이지 않는다고 가정.
-    # recess_mm 부호 규약(_circle_depth_evidence와 동일): 양수=주변 표면보다
-    # 더 멀다(안쪽으로 들어가 있음), 음수=주변보다 더 가깝다(튀어나옴).
-    stud_seating_tolerance_mm: float = 1.0  # |recess|가 이 안이면 표면과 거의 같은 높이(정확)로 봄
+    # --- 스터드(못) 삽입 후 상태 분류 (정상/틀어짐/덜 박힘) ---
+    # 홀 탐지(삽입 전)와는 별개 기능. recess_mm 부호 규약(_circle_depth_evidence와
+    # 동일): 양수=주변 표면보다 더 멀다(안쪽으로 들어가 있음), 음수=주변보다 더
+    # 가깝다(튀어나옴).
+    stud_seating_tolerance_mm: float = 1.0  # |recess|가 이 안이면 표면과 거의 같은 높이(정상)로 봄
     stud_tilt_amplitude_mm: float = 1.2  # 8방향 recess에 맞춘 코사인 진폭이 이보다 커야 "기울어짐" 후보
     stud_tilt_r2: float = 0.6  # 코사인 적합도(R^2)가 이보다 높아야 노이즈가 아니라 진짜 방향성 기울기
+
+    # --- 스터드 머리 위치 탐지 (RGB 색상 기반) ---
+    # 타이어 출력물이 무광 검은색이고 스터드(못) 머리는 은색 금속이라 밝기 대비가
+    # 뚜렷하다 - depth 굴곡(빈 홀 탐지)과 달리 삽입 전 좌표를 저장해둘 필요 없이,
+    # 매 프레임 RGB만으로 스터드 위치를 직접 찾는다. 그래서 카메라나 물체가
+    # 움직여도 안전하다.
+    stud_head_min_brightness: int = 140  # HSV V채널(0~255) - 이보다 밝아야 금속 후보 (검은 PLA는 훨씬 어두움)
+    stud_head_max_saturation: int = 80  # HSV S채널(0~255) - 은색은 채도가 낮음(무채색), 색 있는 반사와 구분
 
 
 @dataclass
@@ -710,6 +716,59 @@ class HoleDetector:
             status = "correct"
 
         return StudState((x, y), status, recess_mm, amplitude, r2)
+
+    def _detect_stud_head_candidates(
+        self, color_bgr: np.ndarray, object_mask: np.ndarray, px_per_mm: float
+    ) -> list[tuple[int, int, int]]:
+        """[역할] 검은 타이어 위 은색 스터드 머리를 RGB 밝기/채도로 찾는다.
+
+        무광 검은 PLA는 거의 항상 어둡고, 금속 스터드 머리는 밝고 무채색(채도
+        낮음)이라 대비가 뚜렷하다 - depth 굴곡(빈 홀 탐지용)과 달리 이전 프레임
+        좌표를 기억할 필요가 없다.
+        """
+        cfg = self.config
+        hsv = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2HSV)
+        value, saturation = hsv[:, :, 2], hsv[:, :, 1]
+        bright = (
+            (value >= cfg.stud_head_min_brightness)
+            & (saturation <= cfg.stud_head_max_saturation)
+            & (object_mask > 0)
+        )
+        mask = bright.astype(np.uint8) * 255
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+
+        min_radius_px = max(2, int(round(cfg.min_hole_diameter_mm / 2 * px_per_mm)))
+        max_radius_px = max(min_radius_px + 1, int(round(cfg.max_hole_diameter_mm / 2 * px_per_mm)))
+        # 반사 얼룩 등으로 완벽한 원이 아닐 수 있어 면적 기준에 여유를 둔다.
+        min_area = np.pi * (min_radius_px * 0.6) ** 2
+        max_area = np.pi * (max_radius_px * 1.3) ** 2
+
+        num, _labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        candidates = []
+        for label in range(1, num):
+            area = stats[label, cv2.CC_STAT_AREA]
+            if area < min_area or area > max_area:
+                continue
+            cx, cy = centroids[label]
+            radius_px = max(2, int(round(np.sqrt(area / np.pi))))
+            candidates.append((int(round(cx)), int(round(cy)), radius_px))
+        return candidates
+
+    def detect_stud_states(self, color_bgr: np.ndarray, depth_m: np.ndarray) -> tuple[list[StudState], dict]:
+        """[역할] 이미 삽입된 스터드를 RGB로 직접 찾아 각각의 상태를 판정한다
+        (holes와 대응되는 메인 진입점). 삽입 전 좌표를 저장해둘 필요가 없다 -
+        매 프레임 그 자리에서 새로 찾기 때문에 카메라/물체가 움직여도 안전하다.
+        """
+        object_mask = self.segment_object(depth_m)
+        if cv2.countNonZero(object_mask) == 0:
+            return [], {"object_mask": object_mask}
+
+        px_per_mm = self._px_per_mm(depth_m, object_mask)
+        depth_mm = depth_m * 1000.0
+        candidates = self._detect_stud_head_candidates(color_bgr, object_mask, px_per_mm)
+        states = [self.classify_stud_state(depth_mm, object_mask, x, y, r) for x, y, r in candidates]
+        return states, {"object_mask": object_mask}
 
     def _evaluate_candidate(self, x, y, radius, depth_mm, depression, object_mask, object_bbox, lines, gray_raw):
         """[역할] 후보 하나를 검증해 (DetectedHole 또는 None, 진단 dict)를 반환한다.
