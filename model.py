@@ -295,6 +295,19 @@ def main() -> None:
         # --- 2. 메인 루프: 프레임마다 캡처 -> 정렬 -> 탐지 -> 시각화 ---
         while True:
             frames = pipeline.wait_for_frames()
+            # 프레임 하나 처리(양방향 필터+Hough 두 번+8섹터 검사)가 카메라 프레임
+            # 주기(33ms)보다 오래 걸리면, librealsense 내부 큐에 못 받아간 프레임이
+            # 계속 쌓인다 - wait_for_frames는 큐의 "가장 오래된" 프레임부터 순서대로
+            # 꺼내주기 때문에, 그대로 두면 시간이 갈수록 화면이 점점 더 과거 시점을
+            # 보여주며 느려진다(실측으로 확인된 문제). poll_for_frames로 이미 도착한
+            # 더 최신 프레임이 있으면 계속 건너뛰어, 매 루프 항상 "지금 가장 최신"
+            # 프레임만 처리한다 - 그만큼 일부 프레임은 아예 처리 안 하고 버려지지만,
+            # 화면이 실시간을 유지하는 게 더 중요하다.
+            while True:
+                newer_frames = pipeline.poll_for_frames()
+                if not newer_frames:
+                    break
+                frames = newer_frames
             frames = align.process(frames)
             depth_frame = frames.get_depth_frame()
             color_frame = frames.get_color_frame()
