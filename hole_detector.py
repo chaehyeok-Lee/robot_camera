@@ -150,8 +150,12 @@ class HoleDetectorConfig:
     # 뚜렷하다 - depth 굴곡(빈 홀 탐지)과 달리 삽입 전 좌표를 저장해둘 필요 없이,
     # 매 프레임 RGB만으로 스터드 위치를 직접 찾는다. 그래서 카메라나 물체가
     # 움직여도 안전하다.
-    stud_head_min_brightness: int = 140  # HSV V채널(0~255) - 이보다 밝아야 금속 후보 (검은 PLA는 훨씬 어두움)
-    stud_head_max_saturation: int = 80  # HSV S채널(0~255) - 은색은 채도가 낮음(무채색), 색 있는 반사와 구분
+    stud_head_min_brightness: int = 140  # B/G/R 중 최댓값(0~255) - 이보다 밝아야 금속 후보 (검은 PLA는 훨씬 어두움)
+    # HSV 채도(S) 대신 R/G/B 채널 간 최대-최소 편차(chroma)를 직접 본다 - 카드보드
+    # 박스/나무 바닥처럼 밝지만 갈색/베이지 색조가 있는 배경이 낮은 HSV 채도로도
+    # 통과되는 게 실측으로 확인됨(같은 물체 거리대에 배경이 살짝 걸치는 경우).
+    # 진짜 은색 금속은 R≈G≈B라 편차가 훨씬 작다.
+    stud_head_max_chroma: int = 25  # R/G/B 최대-최소 편차(0~255) - 이보다 작아야 무채색(은색) 후보
 
 
 @dataclass
@@ -720,18 +724,25 @@ class HoleDetector:
     def _detect_stud_head_candidates(
         self, color_bgr: np.ndarray, object_mask: np.ndarray, px_per_mm: float
     ) -> list[tuple[int, int, int]]:
-        """[역할] 검은 타이어 위 은색 스터드 머리를 RGB 밝기/채도로 찾는다.
+        """[역할] 검은 타이어 위 은색 스터드 머리를 RGB 밝기/무채색 여부로 찾는다.
 
-        무광 검은 PLA는 거의 항상 어둡고, 금속 스터드 머리는 밝고 무채색(채도
-        낮음)이라 대비가 뚜렷하다 - depth 굴곡(빈 홀 탐지용)과 달리 이전 프레임
-        좌표를 기억할 필요가 없다.
+        무광 검은 PLA는 거의 항상 어둡고, 금속 스터드 머리는 밝고 무채색(R≈G≈B)
+        이라 대비가 뚜렷하다 - depth 굴곡(빈 홀 탐지용)과 달리 이전 프레임 좌표를
+        기억할 필요가 없다.
+
+        "무채색"은 HSV 채도가 아니라 R/G/B 채널 간 최대-최소 편차(chroma)로
+        직접 판단한다 - 카드보드 박스/나무 바닥처럼 밝지만 갈색/베이지 색조가
+        있는 배경이 HSV 채도만으로는 걸러지지 않고 후보로 잡히는 게 실측으로
+        확인됐다(물체와 비슷한 거리에 배경이 살짝 걸쳐 object_mask 안에 들어온
+        경우). 진짜 은색 금속은 R/G/B가 서로 거의 같아서 chroma가 훨씬 작다.
         """
         cfg = self.config
-        hsv = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2HSV)
-        value, saturation = hsv[:, :, 2], hsv[:, :, 1]
+        color_i16 = color_bgr.astype(np.int16)
+        channel_max = color_i16.max(axis=2)
+        chroma = channel_max - color_i16.min(axis=2)
         bright = (
-            (value >= cfg.stud_head_min_brightness)
-            & (saturation <= cfg.stud_head_max_saturation)
+            (channel_max >= cfg.stud_head_min_brightness)
+            & (chroma <= cfg.stud_head_max_chroma)
             & (object_mask > 0)
         )
         mask = bright.astype(np.uint8) * 255
