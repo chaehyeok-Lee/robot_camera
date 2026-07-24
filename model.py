@@ -18,12 +18,13 @@ JSON 파일로 저장.
         캡처 중엔 물체/카메라를 움직이지 말 것. 결과 화면은 고정되며, 아무 키나
         누르면 실시간 미리보기로 돌아감 (c/s/q는 각자 원래 동작 유지)
     r - 실시간 화면의 안정화 트래커 초기화 (홀이 잘못 고정돼 안 없어질 때)
-    i - 스터드(못) 삽입 후 검사 모드 켜기/끄기. 켜는 순간의 홀 탐지 좌표를 그대로
-        고정해두고(카메라/물체가 그 뒤로 움직이지 않는다고 가정), 매 프레임 그
-        자리의 depth만 다시 읽어 정확/틀어짐/덜 박힘을 판정해 색으로 표시한다
-        (초록=정확, 노랑=틀어짐, 빨강=덜 박힘, 회색=판정 불가). 로봇이 스터드를
-        박기 직전까지는 기존 홀 탐지로 좌표를 확보해두고, 삽입 후 i를 눌러
-        검사한다.
+    i - 스터드(못) 삽입 후 검사용 좌표를 지금 시점의 홀 탐지 결과로 (다시) 고정.
+        미리보기 클릭 시 진단은 항상 스터드 상태(정확/틀어짐/덜 박힘) 기준으로
+        나온다("i를 계속 누른 상태"와 동일 - 매번 다시 누를 필요 없음). i를 눌러
+        좌표를 고정해두면(카메라/물체가 그 뒤로 움직이지 않는다고 가정) 화면에도
+        그 자리들이 색으로 표시된다(초록=정확, 노랑=틀어짐, 빨강=덜 박힘, 회색=
+        판정 불가). 로봇이 스터드를 박기 직전까지는 기존 홀 탐지로 좌표를 확보해두고,
+        삽입 후 i를 눌러 그 좌표들을 고정한다.
 
 실시간 화면의 빨간 원은 매 프레임 새로 계산한 게 아니라 두 겹으로 안정화된다:
 1) 최근 15프레임을 모아 픽셀별 중앙값으로 depth 노이즈를 줄인 뒤 그 결과로 탐지
@@ -114,7 +115,11 @@ def main() -> None:
     # "저 물체가 카메라에서 몇 m 거리인지" 눈대중 대신 바로 재기 위한 디버그 도구.
     # 창은 [RGB | depth 컬러맵]을 가로로 붙여놨으니, 오른쪽 절반을 클릭해도
     # 같은 depth_m 배열에서 좌표만 옮겨서 읽는다.
-    click_state = {"depth_m": None, "debug": None, "last_click_raw": None, "last_click": None, "stud_mode": False}
+    # stud_mode는 항상 True로 고정 - "i를 계속 누른 상태"처럼 클릭 진단이 항상
+    # 스터드 상태(정확/틀어짐/덜 박힘) 기준으로 나오게 한다. i 키는 더 이상
+    # on/off 토글이 아니라 "지금 시점의 홀 탐지 결과로 검사 좌표를 (다시) 고정"
+    # 하는 동작으로 바뀌었다.
+    click_state = {"depth_m": None, "debug": None, "last_click_raw": None, "last_click": None, "stud_mode": True}
     STUD_STATUS_LABEL = {"correct": "정확", "tilted": "틀어짐", "under_inserted": "덜박힘", "unknown": "불명"}
 
     def on_mouse(event, x, y, flags, param):
@@ -276,14 +281,15 @@ def main() -> None:
     print(
         "D435 hole inspection running. 'q' to quit, 's' to save, 'c' to capture "
         "a 30-frame averaged (denoised) detection, 'r' to reset the live tracker, "
-        "'i' to toggle post-insertion stud-state check, click preview to read depth."
+        "'i' to (re)pin post-insertion stud-check coordinates - click diagnosis is "
+        "always stud-state based, click preview to read depth."
     )
     last_holes: list = []
     last_color: np.ndarray | None = None
-    # 스터드 검사 모드: i를 누른 순간의 홀 좌표(x, y, radius_px)를 고정해서 재사용한다 -
-    # 삽입된 스터드는 더 이상 "홀"처럼 안 보여서 실시간 홀 탐지로는 다시 못 찾기 때문에,
-    # 삽입 전 마지막으로 확인된 좌표에서 그대로 depth 상태만 재판정한다.
-    stud_mode = False
+    # i를 누른 순간의 홀 좌표(x, y, radius_px)를 고정해서 재사용한다 - 삽입된 스터드는
+    # 더 이상 "홀"처럼 안 보여서 실시간 홀 탐지로는 다시 못 찾기 때문에, 삽입 전 마지막으로
+    # 확인된 좌표에서 그대로 depth 상태만 재판정한다. 클릭 진단은 항상 스터드 상태 기준으로
+    # 나오므로(click_state["stud_mode"]=True 고정) 이 목록은 화면 오버레이용으로만 쓰인다.
     stud_targets: list[tuple[int, int, int]] = []
     try:
         # --- 2. 메인 루프: 프레임마다 캡처 -> 정렬 -> 탐지 -> 시각화 ---
@@ -311,22 +317,20 @@ def main() -> None:
             last_color = fused_color
             click_state["depth_m"] = depth_m  # on_mouse가 최신(융합된) 프레임을 읽도록 갱신
 
-            # 핵심 탐지 호출 (hole_detector.py) - RGB(Hough용) + depth 둘 다 전달
-            # 스터드 검사 모드에서도 계속 호출한다 - 실제로 쓰는 건 홀 목록이 아니라
-            # debug["depth_mm"]/["object_mask"](고정 좌표 재판정용)와 object_mask/depression
-            # 오버레이용 산출물이라서.
+            # 핵심 탐지 호출 (hole_detector.py) - RGB(Hough용) + depth 둘 다 전달.
+            # 스터드 검사 좌표가 고정돼 있어도 계속 호출한다 - 실제로 쓰는 건 홀 목록
+            # 뿐 아니라 debug["depth_mm"]/["object_mask"](고정 좌표 재판정용)도 매
+            # 프레임 새로 필요해서다. 홀 목록 자체도 계속 갱신해둬야 'i'를 다시 눌렀을
+            # 때 최신 좌표로 다시 고정할 수 있다.
             raw_holes, debug = detector.detect(fused_color, depth_m)
             # 매 프레임 결과를 바로 쓰지 않고 트래커에 통과시켜 깜빡임을 없앤다 -
             # 여러 프레임 연속으로 잡힌 것만 화면에 남고, 잠깐 놓쳐도 유지된다.
             holes = tracker.update(raw_holes)
-            if not stud_mode:
-                last_holes = holes  # 's' 키로 저장 + 'i' 스냅샷용으로 보관 (스터드 검사 중엔 갱신 안 함)
+            last_holes = holes  # 's' 키로 저장 + 'i' 스냅샷용으로 항상 최신 유지
             click_state["debug"] = debug  # on_mouse가 object_mask/depression도 읽도록 갱신
 
-            click_state["stud_mode"] = stud_mode  # on_mouse가 클릭 시 진단 종류(홀 vs 스터드)를 고르도록 갱신
-
             stud_states = None
-            if stud_mode and stud_targets:
+            if stud_targets:
                 stud_states = [
                     detector.classify_stud_state(debug["depth_mm"], debug["object_mask"], x, y, r)
                     for x, y, r in stud_targets
@@ -345,19 +349,13 @@ def main() -> None:
                 color_history.clear()
                 print("트래커 + 롤링 버퍼 초기화 - 안정화된 홀 목록을 비웠습니다.")
             if key == ord("i"):
-                if not stud_mode:
-                    if not last_holes:
-                        print("스터드 검사 모드: 먼저 삽입 전 홀이 하나 이상 탐지된 상태에서 켜야 합니다.")
-                    else:
-                        stud_targets = [
-                            (h.pixel[0], h.pixel[1], max(3, int(h.diameter_px / 2))) for h in last_holes
-                        ]
-                        stud_mode = True
-                        print(f"스터드 검사 모드 on - {len(stud_targets)}개 좌표 고정 (다시 i를 누르면 끔).")
+                if not last_holes:
+                    print("스터드 검사 좌표 고정: 먼저 홀이 하나 이상 탐지된 상태에서 눌러야 합니다.")
                 else:
-                    stud_mode = False
-                    stud_targets = []
-                    print("스터드 검사 모드 off - 실시간 홀 탐지로 복귀.")
+                    stud_targets = [
+                        (h.pixel[0], h.pixel[1], max(3, int(h.diameter_px / 2))) for h in last_holes
+                    ]
+                    print(f"스터드 검사 좌표 고정 - {len(stud_targets)}개 (다시 i를 누르면 최신 좌표로 갱신).")
             if key == ord("c"):
                 # --- 다중 프레임 평균 캡처: 물체를 고정한 채 노이즈를 줄여 재탐지 ---
                 while True:
