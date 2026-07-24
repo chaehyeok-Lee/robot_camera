@@ -764,11 +764,20 @@ class HoleDetector:
     ) -> list[tuple[int, int, int]]:
         """[역할] 은색 픽셀이 뭉친 덩어리를 찾아 (x,y,radius) 후보로 반환한다.
 
-        완전히 박혀 표면과 거의 같은 높이(flush)라 depth 굴곡이 거의 없는
-        스터드도 이걸로 잡힌다 - depth 굴곡(빈 홀 탐지용)과 달리 이전 프레임
-        좌표를 기억할 필요가 없다. (아직 설계 깊이만큼 안 들어가 굴곡이 남아
-        있는 "덜 박힘" 케이스는 `detect_stud_states`가 별도 경로로 찾는다 -
-        가려진 부분이 많아 여기 면적/밝기 기준을 못 넘기는 경우가 있어서.)
+        depth 굴곡(빈 홀 탐지용)과 달리 이전 프레임 좌표를 기억할 필요가 없다.
+
+        두 크기 등급으로 나눠서 본다 - 덜 박힌 스터드는 구멍 벽에 가려(+그늘져)
+        보이는 금속 면적이 온전한 머리보다 훨씬 작아서, 하나의 최소 면적
+        기준으로는 "노이즈는 걸러내면서 진짜 작은 조각은 통과시키기"가 안 된다:
+        - **완전 블롭**(면적 >= `min_area`): 온전히 다 보이는 머리. 실제 측정된
+          면적으로 반지름을 역산한다(`sqrt(area/pi)`) - 크기 자체가 신뢰할 만한
+          측정값이라서.
+        - **조각**(면적이 `stud_partial_min_silver_area_mm2` ~ `min_area` 사이):
+          가려서 일부만 보이는 경우로 보고 후보에는 넣지만, 조각 자체의 넓이는
+          실제 머리 크기를 반영하지 못하므로(초승달 조각일 뿐) 설계상 알고 있는
+          정상 크기(`default_radius_px`)를 그대로 쓴다. 이보다 작으면(노이즈
+          수준) 버린다 - 반사광 노이즈 픽셀 몇 개가 스터드로 오탐지되는 걸
+          막기 위한 최소 기준.
         """
         cfg = self.config
         mask = self._silver_mask(color_bgr, object_mask).astype(np.uint8) * 255
@@ -777,18 +786,23 @@ class HoleDetector:
 
         min_radius_px = max(2, int(round(cfg.min_hole_diameter_mm / 2 * px_per_mm)))
         max_radius_px = max(min_radius_px + 1, int(round(cfg.max_hole_diameter_mm / 2 * px_per_mm)))
+        default_radius_px = (min_radius_px + max_radius_px) // 2
         # 반사 얼룩 등으로 완벽한 원이 아닐 수 있어 면적 기준에 여유를 둔다.
         min_area = np.pi * (min_radius_px * 0.6) ** 2
         max_area = np.pi * (max_radius_px * 1.3) ** 2
+        min_partial_area = max(4.0, cfg.stud_partial_min_silver_area_mm2 * px_per_mm ** 2)
 
         num, _labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
         candidates = []
         for label in range(1, num):
             area = stats[label, cv2.CC_STAT_AREA]
-            if area < min_area or area > max_area:
-                continue
             cx, cy = centroids[label]
-            radius_px = max(2, int(round(np.sqrt(area / np.pi))))
+            if min_area <= area <= max_area:
+                radius_px = max(2, int(round(np.sqrt(area / np.pi))))
+            elif min_partial_area <= area < min_area:
+                radius_px = default_radius_px
+            else:
+                continue
             candidates.append((int(round(cx)), int(round(cy)), radius_px))
         return candidates
 
@@ -797,45 +811,22 @@ class HoleDetector:
         대응되는 메인 진입점). 삽입 전 좌표를 저장해둘 필요가 없다 - 매 프레임
         그 자리에서 새로 찾기 때문에 카메라/물체가 움직여도 안전하다.
 
-        두 경로로 후보 위치를 찾아 합친다:
-        1. RGB 은색 블롭(`_detect_stud_head_candidates`) - 완전히 박혀 표면과
-           거의 같은 높이(flush)라 depth 굴곡이 거의 없는 스터드를 잡는다.
-        2. 빈 홀과 같은 depth 굴곡 후보(Hough) 중, 그 안에 은색이 일정 면적
-           이상 뭉쳐 있는 것만 - 아직 설계 깊이만큼 안 들어가 굴곡이 남아있으면서
-           안쪽 그늘 때문에 보이는 금속 면적이 작아 경로 1의 기준을 못 넘기는
-           "덜 박힘" 케이스를 잡는다. "은색이 하나라도 있으면"(픽셀 1개) 기준을
-           썼더니 반사광 노이즈 한두 픽셀도 스터드로 오탐지하는 게 실측으로
-           확인돼서, 최소 면적(`stud_partial_min_silver_area_mm2`) 기준으로
-           올렸다 - 은색이 전혀 없거나 노이즈 수준으로만 있으면 후보에서 뺀다.
+        위치는 RGB 은색 픽셀로만 찾는다(`_detect_stud_head_candidates`) - 처음엔
+        "빈 홀과 같은 depth 굴곡(Hough) 후보 안에 은색이 있는지"로 덜 박힌
+        경우를 잡으려 했는데, 실측 결과 그 방식 자체가 구조적으로 안 맞았다:
+        덜 박힌 스터드는 일부는 이미 거의 표면 높이(들어간 부분)고 일부만
+        아직 오목(안 들어간 부분)이라, 빈 홀처럼 깔끔한 원형 굴곡이 아니라서
+        Hough가 애초에 원 후보 자체를 못 찾는 경우가 많았다(depth 신호에
+        의존하는 한 원천적인 한계). 그래서 depth 후보를 아예 거치지 않고,
+        은색 자체를 크기 등급을 나눠(위 함수 참고) 직접 찾는다.
         """
-        cfg = self.config
         object_mask = self.segment_object(depth_m)
         if cv2.countNonZero(object_mask) == 0:
             return [], {"object_mask": object_mask}
 
         px_per_mm = self._px_per_mm(depth_m, object_mask)
         depth_mm = depth_m * 1000.0
-        min_radius_px = max(2, int(round(cfg.min_hole_diameter_mm / 2 * px_per_mm)))
-        max_radius_px = max(min_radius_px + 1, int(round(cfg.max_hole_diameter_mm / 2 * px_per_mm)))
-        min_distance_px = max(4.0, cfg.min_candidate_distance_mm * px_per_mm)
-
-        candidates = list(self._detect_stud_head_candidates(color_bgr, object_mask, px_per_mm))
-
-        sigma_px = cfg.surface_blur_sigma_px or (max_radius_px * 2.5)
-        depression = self._make_depression_image(depth_mm, object_mask, sigma_px)
-        depth_candidates = self._hough_candidates(depression, min_distance_px, min_radius_px, max_radius_px)
-        silver_mask = self._silver_mask(color_bgr, object_mask)
-        height, width = silver_mask.shape
-        min_silver_px = max(4, int(round(cfg.stud_partial_min_silver_area_mm2 * px_per_mm ** 2)))
-        for x, y, r in depth_candidates:
-            top, bottom = max(0, y - r), min(height, y + r + 1)
-            left, right = max(0, x - r), min(width, x + r + 1)
-            silver_count = int(np.count_nonzero(silver_mask[top:bottom, left:right]))
-            if silver_count < min_silver_px:
-                continue  # 은색이 노이즈 수준으로만 있음 - 진짜 빈 홀, 스터드 후보 아님
-            if all((x - ux) ** 2 + (y - uy) ** 2 >= min_distance_px ** 2 for ux, uy, _ur in candidates):
-                candidates.append((x, y, r))
-
+        candidates = self._detect_stud_head_candidates(color_bgr, object_mask, px_per_mm)
         states = [self.classify_stud_state(depth_mm, object_mask, x, y, r) for x, y, r in candidates]
         return states, {"object_mask": object_mask}
 
